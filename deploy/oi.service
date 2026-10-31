@@ -1,0 +1,27 @@
+[Unit]
+Description=OI study workspace
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=oi
+Group=oi
+WorkingDirectory=/opt/oi
+Environment=NODE_ENV=production
+Environment=PORT=3001
+Environment=OI_DATA_DIR=/var/lib/oi
+Environment=OI_TRUST_PROXY=loopback
+EnvironmentFile=-/etc/oi/oi.env
+ExecStart=/usr/bin/node /opt/oi/server/index.mjs --production
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/oi
+
+[Install]
+WantedBy=multi-user.target
