@@ -6,6 +6,524 @@ import path from "node:path";
 import { createApp } from "../server/index.mjs";
 import { notePath, executeTool, listNotes } from "../server/storage.mjs";
 import { DatabaseSync } from "node:sqlite";
+import {
+  modelProfiles,
+  saveModel,
+  resolveModel,
+  publicSettings,
+} from "../server/models.mjs";
+
+test("saving profiles preserves selection and ordering and only falls back when the selected model is removed", async (t) => {
+  const { request, restart } = await fixture(t);
+  const profile = (id, models) => ({
+    id,
+    name: id,
+    baseUrl: `https://${id}.invalid/v1`,
+    apiKey: "secret",
+    models,
+    model: models[0],
+  });
+  await request("/settings", "PUT", profile("first", ["fast", "deep"]));
+  await request("/settings", "PATCH", {
+    activeModelId: "first",
+    model: "deep",
+  });
+  let response = await request(
+    "/settings",
+    "PUT",
+    profile("second", ["other"]),
+  );
+  assert.equal(response.status, 200);
+  let config = await response.json();
+  assert.equal(config.activeModelId, "first");
+  assert.equal(config.model, "deep");
+  response = await request("/settings", "PUT", {
+    ...profile("first", ["fast", "deep"]),
+    model: "fast",
+    apiKey: "",
+  });
+  config = await response.json();
+  assert.equal(config.model, "deep");
+  assert.deepEqual(
+    config.profiles.map((p) => p.id),
+    ["first", "second"],
+  );
+  await request("/settings", "PUT", {
+    ...profile("second", ["other", "extra"]),
+    model: "extra",
+    apiKey: "",
+  });
+  await restart();
+  config = await (await request("/settings")).json();
+  assert.equal(config.model, "deep");
+  config = await (
+    await request("/settings", "PUT", profile("first", ["fast"]))
+  ).json();
+  assert.equal(config.model, "fast");
+  assert.equal(config.activeModelId, "first");
+  config = await (await request("/models/second", "DELETE")).json();
+  assert.equal(config.model, "fast");
+});
+
+test("stale persisted selections recover while explicit unknown selections remain errors", () => {
+  const profiles = [
+    {
+      id: "personal",
+      name: "personal",
+      baseUrl: "https://test.invalid/v1",
+      models: ["current"],
+      model: "current",
+      apiKey: "secret",
+    },
+  ];
+  for (const stored of [
+    { profiles, activeModelId: "removed", activeModel: "old" },
+    { profiles, activeModelId: "personal", activeModel: "removed-model" },
+  ]) {
+    const config = publicSettings(stored);
+    assert.equal(config.activeModelId, "personal");
+    assert.equal(config.model, "current");
+    assert.ok(!JSON.stringify(config).includes("secret"));
+    assert.throws(() => resolveModel(stored, "removed"), /不存在/);
+    assert.throws(
+      () => resolveModel(stored, "personal", "removed-model"),
+      /不在此配置中/,
+    );
+  }
+  assert.equal(
+    publicSettings({ profiles: [], activeModelId: "removed" }).model,
+    "",
+  );
+});
+
+test("connection normalization retains credentials only for the same endpoint and blank names support long model IDs", () => {
+  const model = "m".repeat(200);
+  const stored = saveModel(
+    {},
+    {
+      id: "first",
+      name: "",
+      baseUrl: " https://EXAMPLE.invalid:443/v1/ ",
+      apiKey: " secret ",
+      models: [model],
+    },
+  );
+  assert.equal(stored.profiles[0].apiKey, "secret");
+  assert.equal(stored.profiles[0].name.length, 100);
+  const next = saveModel(stored, {
+    id: "first",
+    baseUrl: "https://example.invalid/v1",
+    apiKey: "",
+    models: [model],
+  });
+  assert.equal(next.profiles[0].apiKey, "secret");
+  assert.throws(
+    () =>
+      saveModel(stored, {
+        id: "first",
+        baseUrl: "https://other.invalid/v1",
+        apiKey: " ",
+        models: [model],
+      }),
+    /填写 API Key/,
+  );
+  for (const baseUrl of [
+    null,
+    12,
+    "invalid",
+    "ftp://example.invalid",
+    "https://example.invalid/v1?query=1",
+  ]) {
+    assert.throws(
+      () => saveModel({}, { baseUrl, apiKey: "secret", model: "test" }),
+      /有效的 HTTP\(S\)/,
+    );
+  }
+});
+
+test("same conversation rejects overlapping generations and stale saves, and can generate again", async (t) => {
+  let finish;
+  let count = 0;
+  const { request } = await fixture(t, async () => {
+    count++;
+    return new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(
+            new TextEncoder().encode(
+              'data: {"choices":[{"delta":{"content":"回复"}}]}\n\n',
+            ),
+          );
+          finish = () => controller.close();
+        },
+      }),
+    );
+  });
+  await request("/settings", "PUT", {
+    baseUrl: "https://test.invalid/v1",
+    model: "test",
+    apiKey: "secret",
+  });
+  const chat = {
+    id: "race",
+    title: "并发",
+    mode: "chat",
+    updatedAt: new Date().toISOString(),
+    messages: [{ id: "q", role: "user", content: "问题" }],
+  };
+  await request("/chats/race", "PUT", chat);
+  const stale = await (await request("/chats/race")).json();
+  const body = {
+    chatId: "race",
+    assistantId: "answer",
+    revision: stale.revision,
+    messages: chat.messages,
+  };
+  const response = await request("/chat", "POST", body);
+  const reader = response.body.getReader();
+  await reader.read();
+  assert.equal(
+    (await request("/chat", "POST", { ...body, assistantId: "other" })).status,
+    409,
+  );
+  assert.equal((await request("/chats/race", "PUT", stale)).status, 409);
+  assert.equal(count, 1);
+  finish();
+  while (!(await reader.read()).done) {}
+  assert.equal((await request("/chats/race", "PUT", stale)).status, 409);
+  const latest = await (await request("/chats/race")).json();
+  assert.deepEqual(
+    latest.messages.map((m) => m.id),
+    ["q", "answer"],
+  );
+  latest.messages.push({ id: "q2", role: "user", content: "新问题" });
+  assert.equal((await request("/chats/race", "PUT", latest)).status, 200);
+  const next = await (await request("/chats/race")).json();
+  const second = await request("/chat", "POST", {
+    ...body,
+    revision: next.revision,
+    assistantId: "answer2",
+    messages: next.messages,
+  });
+  const secondReader = second.body.getReader();
+  await secondReader.read();
+  finish();
+  while (!(await secondReader.read()).done) {}
+  const final = await (await request("/chats/race")).json();
+  assert.deepEqual(
+    final.messages.map((m) => m.id),
+    ["q", "answer", "q2", "answer2"],
+  );
+  await request("/chats/race", "DELETE");
+  assert.equal((await request("/chats/race", "PUT", final)).status, 409);
+});
+
+test("model profiles switch credentials, persist across restart, and remain private", async (t) => {
+  const calls = [];
+  const { request, client, restart } = await fixture(t, async (url, init) => {
+    calls.push({
+      url,
+      key: init.headers.Authorization,
+      model: JSON.parse(init.body).model,
+    });
+    return new Response('data: {"choices":[{"delta":{"content":"ok"}}]}\n\n');
+  });
+  for (const id of ["one", "two"]) {
+    assert.equal(
+      (
+        await request("/settings", "PUT", {
+          id,
+          name: id,
+          baseUrl: `https://${id}.invalid/v1`,
+          model: id,
+          apiKey: `secret-${id}`,
+        })
+      ).status,
+      200,
+    );
+  }
+  let settings = await (await request("/settings")).json();
+  assert.equal(settings.profiles.length, 2);
+  assert.ok(!JSON.stringify(settings).includes("secret-"));
+  assert.equal(settings.activeModelId, "one");
+  await request("/settings", "PATCH", { activeModelId: "one" });
+  await restart();
+  settings = await (await request("/settings")).json();
+  assert.equal(settings.activeModelId, "one");
+  await (
+    await request("/chat", "POST", {
+      messages: [{ role: "user", content: "test" }],
+    })
+  ).text();
+  await (
+    await request("/chat", "POST", {
+      modelId: "two",
+      messages: [{ role: "user", content: "test" }],
+    })
+  ).text();
+  assert.deepEqual(calls, [
+    {
+      url: "https://one.invalid/v1/chat/completions",
+      key: "Bearer secret-one",
+      model: "one",
+    },
+    {
+      url: "https://two.invalid/v1/chat/completions",
+      key: "Bearer secret-two",
+      model: "two",
+    },
+  ]);
+  assert.equal(
+    (
+      await request("/settings", "PUT", {
+        id: "one",
+        name: "changed",
+        baseUrl: "https://one.invalid/v1",
+        model: "one-new",
+        apiKey: "",
+      })
+    ).status,
+    200,
+  );
+  assert.equal(
+    (
+      await request("/settings", "PUT", {
+        id: "one",
+        baseUrl: "https://other.invalid/v1",
+        model: "one",
+        apiKey: "",
+      })
+    ).status,
+    400,
+  );
+  const other = client();
+  await other("/auth/register", "POST", {
+    username: "other-profile",
+    password: "test-password",
+  });
+  assert.equal(
+    (await other("/settings", "PATCH", { activeModelId: "two" })).status,
+    400,
+  );
+  assert.equal((await other("/models/two", "DELETE")).status, 400);
+  assert.equal((await (await other("/settings")).json()).profiles.length, 0);
+  await request("/models/one", "DELETE");
+  assert.equal(
+    (await (await request("/settings")).json()).activeModelId,
+    "two",
+  );
+  await request("/models/two", "DELETE");
+  assert.equal((await (await request("/settings")).json()).profiles.length, 0);
+});
+
+test("models within a profile share credentials and persist the selected model", async (t) => {
+  const calls = [];
+  const { request, restart } = await fixture(t, async (url, init) => {
+    calls.push({
+      url,
+      key: init.headers.Authorization,
+      model: JSON.parse(init.body).model,
+    });
+    return new Response('data: {"choices":[{"delta":{"content":"ok"}}]}\n\n');
+  });
+  const profile = {
+    id: "shared",
+    name: "共享接口",
+    baseUrl: "https://shared.invalid/v1",
+    apiKey: "shared-secret",
+    models: ["fast", "deep", "fast"],
+  };
+  assert.equal((await request("/settings", "PUT", profile)).status, 200);
+  let settings = await (await request("/settings")).json();
+  assert.deepEqual(settings.profiles[0].models, ["fast", "deep"]);
+  assert.equal(settings.model, "fast");
+  assert.equal(
+    (
+      await request("/settings", "PATCH", {
+        activeModelId: "shared",
+        model: "deep",
+      })
+    ).status,
+    200,
+  );
+  await restart();
+  settings = await (await request("/settings")).json();
+  assert.equal(settings.model, "deep");
+  assert.equal(settings.profiles[0].model, "fast");
+  assert.ok(!JSON.stringify(settings).includes("shared-secret"));
+  await (
+    await request("/chat", "POST", {
+      messages: [{ role: "user", content: "test" }],
+    })
+  ).text();
+  await (
+    await request("/chat", "POST", {
+      modelId: "shared",
+      model: "fast",
+      messages: [{ role: "user", content: "test" }],
+    })
+  ).text();
+  assert.deepEqual(
+    calls.map((c) => c.model),
+    ["deep", "fast"],
+  );
+  assert.ok(calls.every((c) => c.key === "Bearer shared-secret"));
+  assert.equal(
+    (
+      await request("/settings", "PATCH", {
+        activeModelId: "shared",
+        model: "missing",
+      })
+    ).status,
+    400,
+  );
+  assert.equal(
+    (
+      await request("/chat", "POST", {
+        modelId: "shared",
+        model: "missing",
+        messages: [{ role: "user", content: "test" }],
+      })
+    ).status,
+    400,
+  );
+  for (const models of [[], [""], [null], "fast", Array(201).fill("fast")])
+    assert.equal(
+      (await request("/settings", "PUT", { ...profile, models })).status,
+      400,
+    );
+  assert.equal(
+    (await request("/settings", "PUT", { ...profile, model: "missing" }))
+      .status,
+    400,
+  );
+  assert.equal(
+    (
+      await request("/settings", "PUT", {
+        ...profile,
+        apiKey: "",
+        models: ["fast"],
+      })
+    ).status,
+    200,
+  );
+  assert.equal((await (await request("/settings")).json()).model, "fast");
+});
+
+test("model discovery uses saved credentials only for the owning account and endpoint", async (t) => {
+  const calls = [];
+  let result = {
+    data: [
+      { id: "z" },
+      { id: "a" },
+      { id: "z" },
+      { id: " a " },
+      { id: "" },
+      { id: 3 },
+      null,
+    ],
+  };
+  let status = 200;
+  const { request, client } = await fixture(t, async (url, init) => {
+    calls.push({ url, init });
+    if (status === 0) throw new Error("private-secret");
+    return new Response(
+      typeof result === "string" ? result : JSON.stringify(result),
+      { status },
+    );
+  });
+  const connection = {
+    id: "provider",
+    baseUrl: "https://provider.invalid/v1/",
+    apiKey: "private-secret",
+  };
+  assert.deepEqual(
+    await (await request("/models/discover", "POST", connection)).json(),
+    { models: ["a", "z"] },
+  );
+  assert.equal((await (await request("/settings")).json()).profiles.length, 0);
+  assert.equal(calls[0].url, "https://provider.invalid/v1/models");
+  assert.equal(calls[0].init.method, "GET");
+  assert.equal(calls[0].init.headers.Authorization, "Bearer private-secret");
+  assert.equal(calls[0].init.redirect, "error");
+  assert.ok(calls[0].init.signal instanceof AbortSignal);
+  await request("/settings", "PUT", { ...connection, model: "a" });
+  assert.equal(
+    (await request("/models/discover", "POST", { ...connection, apiKey: "" }))
+      .status,
+    200,
+  );
+  const count = calls.length;
+  assert.equal(
+    (
+      await request("/models/discover", "POST", {
+        ...connection,
+        baseUrl: "https://other.invalid/v1",
+        apiKey: "",
+      })
+    ).status,
+    400,
+  );
+  const other = client();
+  assert.equal(
+    (await other("/models/discover", "POST", connection)).status,
+    401,
+  );
+  await other("/auth/register", "POST", {
+    username: "discovery-other",
+    password: "test-password",
+  });
+  assert.equal(
+    (await other("/models/discover", "POST", { ...connection, apiKey: "" }))
+      .status,
+    400,
+  );
+  assert.equal(calls.length, count);
+  for (const [value, code, message] of [
+    [{ data: [] }, 200, null],
+    [{ models: [] }, 200, "兼容"],
+    ["invalid json", 200, "JSON"],
+    [{ error: "private-secret" }, 401, "HTTP 401"],
+    [{}, 0, "网络"],
+  ]) {
+    result = value;
+    status = code;
+    const response = await request("/models/discover", "POST", connection);
+    const body = await response.json();
+    assert.equal(response.status, message ? 400 : 200);
+    if (message) assert.ok(body.error.includes(message));
+    else assert.deepEqual(body.models, []);
+    assert.ok(!JSON.stringify(body).includes("private-secret"));
+  }
+});
+
+test("legacy model settings migrate without sharing credentials with a new endpoint", () => {
+  const stored = {
+    baseUrl: "https://legacy.invalid/v1",
+    model: "old",
+    apiKey: "old-secret",
+  };
+  assert.equal(
+    modelProfiles(stored).find((p) => p.id === "legacy").apiKey,
+    "old-secret",
+  );
+  assert.throws(
+    () =>
+      saveModel(stored, {
+        id: "new",
+        baseUrl: stored.baseUrl,
+        model: "new",
+        apiKey: "",
+      }),
+    /API Key/,
+  );
+  const updated = saveModel(stored, {
+    baseUrl: stored.baseUrl,
+    model: "updated",
+    apiKey: "",
+  });
+  assert.equal(updated.profiles[0].apiKey, "old-secret");
+});
 
 async function fixture(
   t,
@@ -404,6 +922,8 @@ test("every new account starts empty, including the first account and accounts r
       apiKey: "",
       hasKey: false,
       reasoningEffort: "default",
+      activeModelId: "",
+      profiles: [],
     });
   };
   await assertEmpty(request);

@@ -44,6 +44,13 @@ export async function openDatabase(dataDir) {
       .some((column) => column.name === "images")
   )
     db.exec("ALTER TABLE messages ADD COLUMN images TEXT");
+  if (
+    !db
+      .prepare("PRAGMA table_info(chats)")
+      .all()
+      .some((c) => c.name === "revision")
+  )
+    db.exec("ALTER TABLE chats ADD COLUMN revision INTEGER NOT NULL DEFAULT 0");
 
   function transaction(fn) {
     db.exec("BEGIN IMMEDIATE");
@@ -66,6 +73,7 @@ export async function openDatabase(dataDir) {
       title: row.title,
       mode: row.mode,
       updatedAt: row.updated_at,
+      revision: row.revision,
       messages: db
         .prepare(
           "SELECT * FROM messages WHERE user_id = ? AND chat_id = ? ORDER BY position",
@@ -83,8 +91,8 @@ export async function openDatabase(dataDir) {
   }
   function writeChat(userId, chat) {
     db.prepare(
-      `INSERT INTO chats VALUES (?, ?, ?, ?, ?)
-      ON CONFLICT(user_id, id) DO UPDATE SET title=excluded.title, mode=excluded.mode, updated_at=excluded.updated_at`,
+      `INSERT INTO chats (user_id, id, title, mode, updated_at) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(user_id, id) DO UPDATE SET title=excluded.title, mode=excluded.mode, updated_at=excluded.updated_at, revision=chats.revision+1`,
     ).run(userId, chat.id, chat.title, chat.mode, chat.updatedAt);
     db.prepare("DELETE FROM messages WHERE user_id = ? AND chat_id = ?").run(
       userId,
@@ -173,7 +181,31 @@ export async function openDatabase(dataDir) {
         .all(userId)
         .map((row) => getChat(userId, row.id));
     },
-    saveChat: (userId, chat) => transaction(() => writeChat(userId, chat)),
+    saveChat: (userId, chat) =>
+      transaction(() => {
+        const current = getChat(userId, chat.id);
+        if (!current && chat.revision !== undefined) {
+          const error = new Error("对话已被删除，请新建对话");
+          error.status = 409;
+          throw error;
+        }
+        if (current && chat.revision !== current.revision) {
+          const error = new Error("对话已在其他页面更新，请重新打开对话后再试");
+          error.status = 409;
+          throw error;
+        }
+        writeChat(userId, chat);
+        return getChat(userId, chat.id);
+      }),
+    saveAssistant: (userId, chatId, assistant) =>
+      transaction(() => {
+        const current = getChat(userId, chatId);
+        if (!current) return;
+        const index = current.messages.findIndex((m) => m.id === assistant.id);
+        if (index < 0) current.messages.push(assistant);
+        else current.messages[index] = assistant;
+        writeChat(userId, { ...current, updatedAt: new Date().toISOString() });
+      }),
     deleteChat: (userId, id) =>
       db
         .prepare("DELETE FROM chats WHERE user_id = ? AND id = ?")

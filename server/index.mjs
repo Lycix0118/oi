@@ -8,6 +8,13 @@ import crypto from "node:crypto";
 import { openDatabase } from "./database.mjs";
 import { validImages, modelContent } from "./images.mjs";
 import {
+  resolveModel,
+  publicSettings,
+  saveModel,
+  modelProfiles,
+  modelConnection,
+} from "./models.mjs";
+import {
   credentials,
   hashPassword,
   verifyPassword,
@@ -67,15 +74,10 @@ export async function createApp({
     }
     next();
   });
-  function config(userId) {
-    const stored = database.settings(userId);
-    return {
-      baseUrl: stored.baseUrl || process.env.AI_BASE_URL || "",
-      model: stored.model || process.env.AI_MODEL || "",
-      apiKey: stored.apiKey || process.env.AI_API_KEY || "",
-      reasoningEffort: stored.reasoningEffort || "default",
-    };
-  }
+  const config = (userId, modelId, model) =>
+    resolveModel(database.settings(userId), modelId, model);
+  const generations = new Map();
+  const generationKey = (userId, chatId) => JSON.stringify([userId, chatId]);
   const route = (fn) => (req, res, next) =>
     Promise.resolve(fn(req, res)).catch(next);
   app.get("/api/health", (_, res) => res.json({ ok: true }));
@@ -157,50 +159,115 @@ export async function createApp({
   app.get(
     "/api/settings",
     route(async (req, res) => {
-      const c = config(req.user.id);
-      res.json({
-        baseUrl: c.baseUrl,
-        model: c.model,
-        apiKey: "",
-        hasKey: !!c.apiKey,
-        reasoningEffort: c.reasoningEffort,
-      });
+      res.json(publicSettings(database.settings(req.user.id)));
     }),
   );
   app.put(
     "/api/settings",
     route(async (req, res) => {
-      const { baseUrl, model, apiKey } = req.body;
-      const url = new URL(baseUrl);
-      if (
-        !["http:", "https:"].includes(url.protocol) ||
-        url.username ||
-        url.password ||
-        url.search ||
-        url.hash
-      )
-        throw new Error("请输入有效的 HTTP(S) 接口地址");
-      if (typeof model !== "string" || !model.trim() || model.length > 200)
-        throw new Error("请输入模型名称");
-      if (typeof apiKey !== "string" || apiKey.length > 4096)
-        throw new Error("API Key 格式无效");
-      const previous = config(req.user.id);
-      database.updateSettings(req.user.id, {
-        baseUrl: baseUrl.trim().replace(/\/+$/, ""),
-        model: model.trim(),
-        apiKey: apiKey || previous.apiKey,
-      });
-      res.json({ ok: true });
+      database.updateSettings(
+        req.user.id,
+        saveModel(database.settings(req.user.id), req.body),
+      );
+      res.json(publicSettings(database.settings(req.user.id)));
     }),
   );
   app.patch(
     "/api/settings",
     route(async (req, res) => {
       const { reasoningEffort } = req.body;
+      if (Object.hasOwn(req.body, "activeModelId")) {
+        const selected = config(
+          req.user.id,
+          req.body.activeModelId,
+          req.body.model,
+        );
+        if (
+          Object.hasOwn(req.body, "model") &&
+          (typeof req.body.model !== "string" || !req.body.model)
+        )
+          throw new Error("请选择模型");
+        if (
+          typeof req.body.activeModelId !== "string" ||
+          !req.body.activeModelId
+        )
+          throw new Error("请选择模型配置");
+        database.updateSettings(req.user.id, {
+          activeModelId: req.body.activeModelId,
+          activeModel: selected.model,
+        });
+        return res.json(publicSettings(database.settings(req.user.id)));
+      }
       if (!["default", "low", "medium", "high"].includes(reasoningEffort))
         throw new Error("无效的思考强度");
       database.updateSettings(req.user.id, { reasoningEffort });
       res.json({ ok: true });
+    }),
+  );
+  app.delete(
+    "/api/models/:id",
+    route(async (req, res) => {
+      const stored = database.settings(req.user.id);
+      const profiles = modelProfiles(stored);
+      const target = profiles.find((p) => p.id === req.params.id);
+      if (!target || target.readOnly) throw new Error("此模型配置不可删除");
+      const remaining = profiles.filter((p) => p.id !== target.id);
+      const selected = resolveModel(stored);
+      const fallback = remaining.find((p) => !p.readOnly) || remaining[0];
+      database.updateSettings(req.user.id, {
+        profiles: remaining.filter((p) => !p.readOnly),
+        activeModelId:
+          selected.id === target.id ? fallback?.id || "" : selected.id || "",
+        activeModel:
+          selected.id === target.id ? fallback?.model || "" : selected.model,
+      });
+      res.json(publicSettings(database.settings(req.user.id)));
+    }),
+  );
+  app.post(
+    "/api/models/discover",
+    route(async (req, res) => {
+      const connection = modelConnection(
+        database.settings(req.user.id),
+        req.body,
+      );
+      let response;
+      try {
+        response = await fetchImpl(`${connection.baseUrl}/models`, {
+          method: "GET",
+          headers: {
+            Authorization: `Bearer ${connection.apiKey}`,
+            Accept: "application/json",
+          },
+          signal: AbortSignal.timeout(15000),
+          redirect: "error",
+        });
+      } catch {
+        throw new Error("获取模型列表失败，请检查接口地址、网络或稍后重试");
+      }
+      if (!response.ok)
+        throw new Error(
+          `获取模型列表失败（HTTP ${response.status}），请检查接口地址、密钥及权限`,
+        );
+      let data;
+      try {
+        data = await response.json();
+      } catch {
+        throw new Error("接口返回的模型列表不是有效 JSON");
+      }
+      if (!Array.isArray(data?.data))
+        throw new Error("接口未返回兼容的模型列表，请手动添加模型");
+      const models = [
+        ...new Set(
+          data.data
+            .map((m) => m?.id)
+            .filter(
+              (id) => typeof id === "string" && id.trim() && id.length <= 200,
+            )
+            .map((id) => id.trim()),
+        ),
+      ].sort();
+      res.json({ models });
     }),
   );
   app.get(
@@ -337,6 +404,10 @@ export async function createApp({
     "/api/chats/:id",
     route(async (req, res) => {
       const chat = req.body;
+      if (generations.has(generationKey(req.user.id, req.params.id)))
+        return res
+          .status(409)
+          .json({ error: "此对话正在生成，请等待完成后重新打开对话" });
       if (
         chat.id !== req.params.id ||
         !["chat", "agent"].includes(chat.mode) ||
@@ -375,16 +446,17 @@ export async function createApp({
         )
       )
         throw new Error("无效的对话数据");
-      database.saveChat(req.user.id, {
+      const saved = database.saveChat(req.user.id, {
         ...chat,
         updatedAt: new Date().toISOString(),
       });
-      res.json({ ok: true });
+      res.json({ ok: true, revision: saved.revision });
     }),
   );
   app.delete(
     "/api/chats/:id",
     route(async (req, res) => {
+      generations.get(generationKey(req.user.id, req.params.id))?.abort();
       database.deleteChat(req.user.id, req.params.id);
       res.json({ ok: true });
     }),
@@ -393,7 +465,7 @@ export async function createApp({
   app.post(
     "/api/chat",
     route(async (req, res) => {
-      const c = config(req.user.id);
+      const c = config(req.user.id, req.body.modelId, req.body.model);
       if (!c.baseUrl || !c.model || !c.apiKey)
         return res
           .status(400)
@@ -427,7 +499,9 @@ export async function createApp({
       if (
         savedChat &&
         (typeof req.body.assistantId !== "string" ||
-          req.body.assistantId.length > 100)
+          !req.body.assistantId ||
+          req.body.assistantId.length > 100 ||
+          savedChat.messages.some((m) => m.id === req.body.assistantId))
       )
         throw new Error("无效的消息标识");
       const savedAssistant = {
@@ -437,6 +511,19 @@ export async function createApp({
         reasoning: "",
         tools: [],
       };
+      const key = generationKey(req.user.id, req.body.chatId);
+      if (savedChat && generations.has(key))
+        return res
+          .status(409)
+          .json({ error: "此对话正在其他页面生成，请等待完成后重新打开对话" });
+      if (
+        savedChat &&
+        req.body.revision !== undefined &&
+        req.body.revision !== savedChat.revision
+      )
+        return res
+          .status(409)
+          .json({ error: "对话已更新，请重新打开对话后再试" });
       let lastSaved = 0;
       const saveProgress = (force = false) => {
         if (!savedChat || (!force && Date.now() - lastSaved < 1000)) return;
@@ -447,16 +534,11 @@ export async function createApp({
           savedAssistant.content ||
           savedAssistant.reasoning ||
           savedAssistant.tools.length;
-        database.saveChat(req.user.id, {
-          ...savedChat,
-          updatedAt: new Date().toISOString(),
-          messages: [
-            ...savedChat.messages,
-            ...(hasReply ? [savedAssistant] : []),
-          ],
-        });
+        if (hasReply)
+          database.saveAssistant(req.user.id, savedChat.id, savedAssistant);
       };
       const controller = new AbortController();
+      if (savedChat) generations.set(key, controller);
       res.on("close", () => controller.abort());
       res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
       res.setHeader("X-Accel-Buffering", "no");
@@ -625,8 +707,12 @@ export async function createApp({
           });
       } finally {
         clearInterval(heartbeat);
-        saveProgress(true);
-        res.end();
+        try {
+          saveProgress(true);
+        } finally {
+          if (generations.get(key) === controller) generations.delete(key);
+          res.end();
+        }
       }
     }),
   );
@@ -654,7 +740,7 @@ export async function createApp({
   }
   app.use((error, _req, res, _next) => {
     if (!res.headersSent)
-      res.status(error.code === "ENOENT" ? 404 : 400).json({
+      res.status(error.status || (error.code === "ENOENT" ? 404 : 400)).json({
         error:
           error.code === "ENOENT" ? "文件不存在" : error.message || "请求失败",
       });

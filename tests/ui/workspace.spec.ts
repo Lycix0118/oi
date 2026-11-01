@@ -1,5 +1,436 @@
 import { test, expect } from "@playwright/test";
 import type { Page } from "@playwright/test";
+import type { Route } from "@playwright/test";
+
+// Mock the server's persisted reply as well as its stream.
+async function saveMockReply(page: Page, route: Route, content: string) {
+  const body = route.request().postDataJSON();
+  const chat = await (
+    await page.request.get(`/api/chats/${body.chatId}`)
+  ).json();
+  chat.messages.push({ id: body.assistantId, role: "assistant", content });
+  expect(
+    (await page.request.put(`/api/chats/${body.chatId}`, { data: chat })).ok(),
+  ).toBeTruthy();
+}
+
+test("multiple model profiles can be created, edited, switched and deleted", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await expect(page.getByRole("slider", { name: "思考强度" })).toBeEnabled();
+  const createProfile = async (
+    name: string,
+    model: string,
+    endpoint: string,
+    key: string,
+  ) => {
+    if (await page.locator(".model-select").count())
+      await page.locator(".model-select").click();
+    else
+      await page
+        .getByRole("button", { name: "管理模型配置", exact: true })
+        .click();
+    const addProfile = page.getByRole("button", {
+      name: "新增配置",
+      exact: true,
+    });
+    if (await addProfile.isEnabled()) await addProfile.click();
+    await page
+      .getByRole("textbox", { name: "配置名称", exact: true })
+      .fill(name);
+    await page.getByLabel("接口地址").fill(endpoint);
+    await page.getByLabel("添加模型 ID").fill(model);
+    await page.getByLabel("API Key", { exact: false }).fill(key);
+    await page.getByRole("button", { name: "保存配置", exact: true }).click();
+    await expect(page.getByRole("dialog", { name: "模型配置" })).toHaveCount(0);
+  };
+  await createProfile(
+    "快速解题",
+    "fast-model",
+    "https://fast.invalid/v1",
+    "fast-secret",
+  );
+  await createProfile(
+    "深入分析",
+    "deep-model",
+    "https://deep.invalid/v1",
+    "deep-secret",
+  );
+  const select = page.getByRole("combobox", { name: "快速切换模型" });
+  await expect(select.locator("option")).toHaveCount(2);
+  await expect(page.locator(".model-select")).toHaveCount(0);
+  const settings = await (await page.request.get("/api/settings")).json();
+  const fast = settings.profiles.find(
+    (p: { name: string }) => p.name === "快速解题",
+  );
+  await select.selectOption(JSON.stringify([fast.id, "fast-model"]));
+  await expect(select.locator("option:checked")).toContainText("fast-model");
+  await page.reload();
+  await expect(select).toHaveValue(JSON.stringify([fast.id, "fast-model"]));
+  await page.getByRole("button", { name: "管理模型配置", exact: true }).click();
+  await expect(page.getByLabel("API Key", { exact: false })).toHaveValue("");
+  await page
+    .getByRole("button", { name: "移除模型 fast-model", exact: true })
+    .click();
+  await page.getByLabel("添加模型 ID").fill("fast-model-v2");
+  await page.getByRole("button", { name: "保存配置", exact: true }).click();
+  await expect(select.locator("option:checked")).toContainText("fast-model-v2");
+  await page.getByRole("button", { name: "管理模型配置", exact: true }).click();
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "删除配置", exact: true }).click();
+  await expect(select.locator("option")).toHaveCount(1);
+  await expect(select.locator("option:checked")).toContainText("deep-model");
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth,
+    ),
+  ).toBe(true);
+  await page.screenshot({
+    path: "test-results/model-profiles-mobile.png",
+    fullPage: true,
+  });
+});
+
+test("one configuration supports manual models, API selection and persistent switching", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.locator(".model-select").click();
+  await page.getByLabel("配置名称", { exact: true }).fill("共享服务");
+  await page.getByLabel("接口地址").fill("https://provider.invalid/v1");
+  await page.getByLabel("添加模型 ID").fill("manual-model");
+  await page.getByRole("button", { name: "添加模型", exact: true }).click();
+  await page.getByLabel("API Key", { exact: false }).fill("secret");
+  await page.route("**/api/models/discover", (route) =>
+    route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        models: ["api-fast", "api-deep", "manual-model"],
+      }),
+    }),
+  );
+  await page.getByRole("button", { name: "从 API 获取模型列表" }).click();
+  await page.getByRole("checkbox", { name: "api-fast", exact: true }).check();
+  await page.getByLabel("搜索可用模型").fill("deep");
+  await page.getByRole("checkbox", { name: "api-deep", exact: true }).check();
+  await page.getByRole("button", { name: "加入所选模型（2）" }).click();
+  await expect(
+    page.getByRole("region", { name: "配置中的模型" }),
+  ).toContainText("api-deep");
+  await page.getByLabel("添加模型 ID").fill("extra-model");
+  await page.getByRole("button", { name: "添加模型", exact: true }).click();
+  await page.getByRole("button", { name: "移除模型 extra-model" }).click();
+  await page.getByRole("button", { name: "保存配置", exact: true }).click();
+  const select = page.getByRole("combobox", { name: "快速切换模型" });
+  await expect(select.locator("optgroup")).toHaveCount(1);
+  await expect(select.locator("option")).toHaveCount(3);
+  const settings = await (await page.request.get("/api/settings")).json();
+  expect(settings.profiles[0].models).toEqual([
+    "manual-model",
+    "api-fast",
+    "api-deep",
+  ]);
+  await select.selectOption({ label: "共享服务 · api-deep" });
+  await page.reload();
+  await expect(select.locator("option:checked")).toHaveText(
+    "共享服务 · api-deep",
+  );
+  await page.getByRole("button", { name: "管理模型配置", exact: true }).click();
+  await expect(page.getByLabel("API Key", { exact: false })).toHaveValue("");
+  await page.unroute("**/api/models/discover");
+  await page.route("**/api/models/discover", (route) =>
+    route.fulfill({
+      status: 400,
+      contentType: "application/json",
+      body: JSON.stringify({ error: "获取模型列表失败（HTTP 401）" }),
+    }),
+  );
+  await page.getByRole("button", { name: "从 API 获取模型列表" }).click();
+  await expect(page.getByRole("alert")).toContainText("HTTP 401");
+  await expect(
+    page.getByRole("region", { name: "配置中的模型" }),
+  ).toContainText("api-fast");
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(
+    page.getByRole("button", { name: "保存配置", exact: true }),
+  ).toBeInViewport();
+  const saveBox = await page
+    .getByRole("button", { name: "保存配置", exact: true })
+    .boundingBox();
+  const dialogBox = await page
+    .getByRole("dialog", { name: "模型配置" })
+    .boundingBox();
+  expect(saveBox!.y + saveBox!.height).toBeLessThanOrEqual(
+    dialogBox!.y + dialogBox!.height,
+  );
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth,
+    ),
+  ).toBe(true);
+  await page.screenshot({
+    path: "test-results/multi-model-settings-mobile.png",
+    fullPage: true,
+  });
+});
+
+test("model configuration keeps current selection, protects edits and isolates key hints", async ({
+  page,
+}) => {
+  for (const id of ["first", "second"]) {
+    expect(
+      (
+        await page.request.put("/api/settings", {
+          data: {
+            id,
+            name: id,
+            baseUrl: `https://${id}.invalid/v1`,
+            apiKey: "secret",
+            models: ["fast", "deep"],
+            model: "fast",
+          },
+        })
+      ).ok(),
+    ).toBeTruthy();
+  }
+  await page.request.patch("/api/settings", {
+    data: { activeModelId: "first", model: "deep" },
+  });
+  await page.goto("/");
+  const select = page.getByRole("combobox", { name: "快速切换模型" });
+  const current = JSON.stringify(["first", "deep"]);
+  await expect(select).toHaveValue(current);
+  await page.getByRole("button", { name: "管理模型配置", exact: true }).click();
+  await expect(
+    page.getByRole("radio", { name: "设为默认模型 fast", exact: true }),
+  ).toBeChecked();
+  await expect(
+    page.getByRole("button", { name: "保存配置", exact: true }),
+  ).toBeDisabled();
+  await expect(
+    page.getByRole("button", { name: /first.*当前使用/ }),
+  ).toHaveAttribute("aria-pressed", "true");
+  const name = page.getByLabel("配置名称", { exact: true });
+  await name.fill("");
+  await name.pressSequentially("first-edited");
+  await expect(name).toHaveValue("first-edited");
+  page.once("dialog", (dialog) => dialog.dismiss());
+  await page.getByRole("button", { name: "关闭弹窗" }).click();
+  await expect(name).toHaveValue("first-edited");
+  page.once("dialog", (dialog) => dialog.dismiss());
+  await page
+    .getByRole("button", { name: "second 2 个模型", exact: true })
+    .click();
+  await expect(name).toHaveValue("first-edited");
+  await page.getByLabel("添加模型 ID").fill("pending-model");
+  await page.getByRole("button", { name: "保存配置", exact: true }).click();
+  await expect(select).toHaveValue(current);
+  let settings = await (await page.request.get("/api/settings")).json();
+  expect(settings.profiles[0].models).toEqual([
+    "fast",
+    "deep",
+    "pending-model",
+  ]);
+  expect(settings.profiles.map((p: { id: string }) => p.id)).toEqual([
+    "first",
+    "second",
+  ]);
+  await page.getByRole("button", { name: "管理模型配置", exact: true }).click();
+  await page
+    .getByRole("button", { name: "second 2 个模型", exact: true })
+    .click();
+  await page
+    .getByRole("radio", { name: "设为默认模型 deep", exact: true })
+    .check();
+  await page.getByRole("button", { name: "保存配置", exact: true }).click();
+  await expect(select).toHaveValue(current);
+  await page.getByRole("button", { name: "管理模型配置", exact: true }).click();
+  await page.getByRole("button", { name: "显示密钥", exact: true }).click();
+  await page.getByRole("button", { name: "新增配置", exact: true }).click();
+  const key = page.getByLabel("API Key", { exact: true });
+  await expect(key).toHaveAttribute("type", "password");
+  await expect(key).toHaveAttribute("placeholder", "输入 API Key");
+  await expect(key).toHaveAttribute("required", "");
+  await page.getByRole("button", { name: "取消", exact: true }).click();
+  await page.reload();
+  await expect(select).toHaveValue(current);
+  await page.getByRole("button", { name: "管理模型配置", exact: true }).click();
+  await page
+    .getByRole("button", { name: "second 2 个模型", exact: true })
+    .click();
+  await page.getByRole("button", { name: "使用默认模型", exact: true }).click();
+  await expect(select).toHaveValue(JSON.stringify(["second", "deep"]));
+  settings = await (await page.request.get("/api/settings")).json();
+  expect(settings.activeModelId).toBe("second");
+});
+
+test("model discovery preserves manual input, normalizes key reuse and explains empty search results", async ({
+  page,
+}) => {
+  await page.request.put("/api/settings", {
+    data: {
+      id: "first",
+      name: "first",
+      baseUrl: "https://first.invalid/v1",
+      apiKey: "secret",
+      model: "fast",
+    },
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "管理模型配置", exact: true }).click();
+  await page.getByLabel("接口地址").fill("https://FIRST.invalid:443/v1/");
+  const key = page.getByLabel("API Key", { exact: true });
+  await expect(key).not.toHaveAttribute("required");
+  await page.getByLabel("添加模型 ID").fill("manual-pending");
+  await page.route("**/api/models/discover", (route) =>
+    route.fulfill({ json: { models: ["fast", "discovered"] } }),
+  );
+  await page.getByRole("button", { name: "从 API 获取模型列表" }).click();
+  await expect(page.getByLabel("添加模型 ID")).toHaveValue("manual-pending");
+  await page.getByLabel("搜索可用模型").fill("does-not-exist");
+  await expect(page.getByText("没有匹配的模型", { exact: true })).toBeVisible();
+  await page.getByLabel("搜索可用模型").fill("");
+  await page.getByRole("checkbox", { name: "discovered", exact: true }).check();
+  await page.unroute("**/api/models/discover");
+  await page.route("**/api/models/discover", (route) =>
+    route.fulfill({ status: 400, json: { error: "获取失败" } }),
+  );
+  await page.getByRole("button", { name: "从 API 获取模型列表" }).click();
+  await expect(page.getByRole("alert")).toHaveText("获取失败");
+  await expect(
+    page.getByRole("checkbox", { name: "discovered", exact: true }),
+  ).toBeChecked();
+  await expect(page.getByLabel("添加模型 ID")).toHaveValue("manual-pending");
+  await page.getByLabel("接口地址").fill("https://changed.invalid/v1");
+  await expect(key).toHaveAttribute("required", "");
+  await expect(key).toHaveAttribute("placeholder", "输入 API Key");
+  await expect(
+    page.getByRole("button", { name: "从 API 获取模型列表" }),
+  ).toBeDisabled();
+  await expect(page.getByLabel("添加模型 ID")).toHaveValue("manual-pending");
+});
+
+test("failed model switches restore selection and settings footer stays visible on short screens", async ({
+  page,
+}) => {
+  const longModel = "long-model-" + "x".repeat(180);
+  await page.request.put("/api/settings", {
+    data: {
+      id: "first",
+      name: "first",
+      baseUrl: "https://first.invalid/v1",
+      apiKey: "secret",
+      models: ["fast", longModel],
+      model: "fast",
+    },
+  });
+  await page.goto("/");
+  const select = page.getByRole("combobox", { name: "快速切换模型" });
+  await page.route("**/api/settings", (route) =>
+    route.request().method() === "PATCH"
+      ? route.fulfill({ status: 400, json: { error: "切换失败" } })
+      : route.continue(),
+  );
+  await select.selectOption(JSON.stringify(["first", longModel]));
+  await expect(page.getByRole("status")).toContainText("切换失败");
+  await expect(select).toHaveValue(JSON.stringify(["first", "fast"]));
+  await expect(page.locator(".toast")).toHaveClass(/toast-error/);
+  await expect(select).toBeEnabled();
+  await page.getByRole("button", { name: "管理模型配置", exact: true }).click();
+  for (const viewport of [
+    { width: 390, height: 620 },
+    { width: 768, height: 480 },
+    { width: 320, height: 568 },
+  ]) {
+    await page.setViewportSize(viewport);
+    await expect(
+      page.getByRole("button", { name: "保存配置", exact: true }),
+    ).toBeInViewport({ ratio: 1 });
+    const bounds = await page.locator(".profile-editor-fields").boundingBox();
+    expect(bounds!.height).toBeGreaterThan(40);
+    expect(
+      await page.evaluate(
+        () => document.documentElement.scrollWidth <= innerWidth,
+      ),
+    ).toBe(true);
+    const dialog = page.getByRole("dialog", { name: "模型配置" });
+    expect(
+      await dialog.evaluate((el) => el.scrollWidth <= el.clientWidth),
+    ).toBe(true);
+  }
+  await page.screenshot({
+    path: "test-results/model-settings-small-screen.png",
+    fullPage: true,
+  });
+});
+
+test("read-only server configuration offers valid actions and selected API models save without losing manual input", async ({
+  page,
+}) => {
+  const serverProfile = {
+    id: "server-default",
+    name: "服务器默认",
+    baseUrl: "https://server.invalid/v1",
+    model: "server-model",
+    models: ["server-model"],
+    apiKey: "",
+    hasKey: true,
+    readOnly: true,
+  };
+  await page.route("**/api/settings", (route) =>
+    route.request().method() === "GET"
+      ? route.fulfill({
+          json: {
+            ...serverProfile,
+            activeModelId: serverProfile.id,
+            profiles: [serverProfile],
+          },
+        })
+      : route.continue(),
+  );
+  await page.goto("/");
+  await page.getByRole("button", { name: "管理模型配置", exact: true }).click();
+  await expect(
+    page.getByRole("button", { name: "保存配置", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "删除配置", exact: true }),
+  ).toHaveCount(0);
+  await expect(page.getByLabel("API Key", { exact: true })).toBeDisabled();
+  await expect(
+    page.getByRole("button", { name: "显示密钥", exact: true }),
+  ).toBeDisabled();
+  await page.getByRole("button", { name: "新增配置", exact: true }).click();
+  await expect(page.getByLabel("API Key", { exact: true })).toHaveAttribute(
+    "placeholder",
+    "输入 API Key",
+  );
+  await page.getByLabel("接口地址").fill("https://personal.invalid/v1");
+  await page.getByLabel("API Key", { exact: true }).fill("secret");
+  await page.getByLabel("添加模型 ID").fill("manual-pending");
+  await page.route("**/api/models/discover", (route) =>
+    route.fulfill({ json: { models: ["discovered", "also-selected"] } }),
+  );
+  await page.getByRole("button", { name: "从 API 获取模型列表" }).click();
+  await page.getByRole("checkbox", { name: "discovered", exact: true }).check();
+  await page.getByRole("button", { name: "加入所选模型（1）" }).click();
+  await expect(page.getByLabel("添加模型 ID")).toHaveValue("manual-pending");
+  await page
+    .getByRole("checkbox", { name: "also-selected", exact: true })
+    .check();
+  await page.getByRole("button", { name: "保存配置", exact: true }).click();
+  await expect(page.getByRole("dialog", { name: "模型配置" })).toHaveCount(0);
+  await page.unroute("**/api/settings");
+  const settings = await (await page.request.get("/api/settings")).json();
+  expect(settings.profiles[0].models).toEqual([
+    "discovered",
+    "also-selected",
+    "manual-pending",
+  ]);
+  expect(settings.profiles[0].model).toBe("discovered");
+});
 
 test.beforeEach(async ({ page }, testInfo) => {
   if (testInfo.title.startsWith("authentication")) return;
@@ -63,7 +494,8 @@ test("library startup skips Markdown bundles and chat bodies until they are open
   await expect(
     page.getByRole("heading", { name: "按需读取正文" }),
   ).toBeVisible();
-  expect(requests.filter((url) => url === `/api/chats/${id}`)).toHaveLength(1);
+  // Reopening a chat revalidates its contents to pick up changes from other tabs.
+  expect(requests.filter((url) => url === `/api/chats/${id}`)).toHaveLength(2);
 });
 
 test("authentication registration, settings persistence, logout and login on mobile", async ({
@@ -100,11 +532,13 @@ test("authentication registration, settings persistence, logout and login on mob
     .getByRole("textbox", { name: /接口地址/ })
     .fill("https://personal.test/v1");
   await settings
-    .getByRole("textbox", { name: /模型名称/ })
+    .getByRole("textbox", { name: "添加模型 ID" })
     .fill("personal-model");
   await settings.locator(".password-input input").fill("personal-secret");
   await settings.getByRole("button", { name: "保存配置" }).click();
-  await expect(page.locator(".model-select")).toHaveText("personal-model");
+  await expect(page.locator(".model-quick-select option:checked")).toHaveText(
+    "personal-model",
+  );
   const effort = page.getByRole("slider", { name: "思考强度" });
   await effort.focus();
   await Promise.all([
@@ -141,7 +575,9 @@ test("authentication registration, settings persistence, logout and login on mob
   await page.screenshot({ path: "test-results/auth-login-mobile.png" });
   await login.getByRole("button", { name: "登录", exact: true }).click();
   await expect(page.locator(".account-name")).toHaveText(username);
-  await expect(page.locator(".model-select")).toHaveText("personal-model");
+  await expect(page.locator(".model-quick-select option:checked")).toHaveText(
+    "personal-model",
+  );
   await expect(effort).toHaveAttribute("aria-valuetext", "高");
   expect(
     await page.evaluate(
@@ -444,6 +880,11 @@ test("streamed chat, stop control and conversation persistence with a mocked AI 
     expect(
       request.messages.every((m: { role: string }) => m.role !== "system"),
     ).toBe(true);
+    await saveMockReply(
+      page,
+      route,
+      "## 二分查找\n\n利用单调性，每次排除一半区间。",
+    );
     await route.fulfill({
       contentType: "text/event-stream",
       body: 'data: {"type":"delta","text":"## 二分查找\\n\\n利用单调性，每次排除一半区间。"}\n\ndata: {"type":"done"}\n\n',
@@ -530,6 +971,7 @@ test("paste images into the composer, remove previews, send without text and res
     | undefined;
   await page.route("**/api/chat", async (route) => {
     sent = route.request().postDataJSON();
+    await saveMockReply(page, route, "收到题目图片");
     await route.fulfill({
       contentType: "text/event-stream",
       body: 'data: {"type":"delta","text":"收到题目图片"}\n\ndata: {"type":"done"}\n\n',
@@ -764,12 +1206,13 @@ test("LaTeX renders in notes, split preview and chat while ordinary code stays l
       },
     }),
   );
-  await page.route("**/api/chat", (route) =>
-    route.fulfill({
+  await page.route("**/api/chat", async (route) => {
+    await saveMockReply(page, route, content);
+    return route.fulfill({
       contentType: "text/event-stream",
       body: `data: ${JSON.stringify({ type: "delta", text: content })}\n\ndata: {"type":"done"}\n\n`,
-    }),
-  );
+    });
+  });
   await page.goto("/#chat");
   await page.reload();
   await expect(page.getByRole("slider", { name: "思考强度" })).toBeEnabled();

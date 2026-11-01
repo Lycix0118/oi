@@ -82,6 +82,7 @@ export default function App() {
     apiKey: "",
   });
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [switchingModel, setSwitchingModel] = useState(false);
   const [input, setInput] = useState("");
   const [attachments, setAttachments] = useState<
     { name: string; content: string; dataUrl?: string }[]
@@ -90,6 +91,7 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [effortIndex, setEffortIndex] = useState(0);
   const [toast, setToast] = useState("");
+  const [toastKind, setToastKind] = useState<"success" | "error">("success");
   const [error, setError] = useState("");
   const [search, setSearch] = useState(false);
   const [query, setQuery] = useState("");
@@ -118,11 +120,15 @@ export default function App() {
   const active = chats.find((c) => c.id === activeId && c.mode === mode);
   const messages = active?.messages || [];
 
-  const notify = useCallback((text: string) => {
-    setToast(text);
-    clearTimeout(toastTimer.current);
-    toastTimer.current = setTimeout(() => setToast(""), 3200);
-  }, []);
+  const notify = useCallback(
+    (text: string, kind: "success" | "error" = "success") => {
+      setToast(text);
+      setToastKind(kind);
+      clearTimeout(toastTimer.current);
+      toastTimer.current = setTimeout(() => setToast(""), 3200);
+    },
+    [],
+  );
 
   const refreshNotes = useCallback(async () => {
     const owner = currentUser.current;
@@ -133,26 +139,6 @@ export default function App() {
         setNotes(values.notes);
         setFolderPaths(values.folders);
       }
-    } catch (e) {
-      notify((e as Error).message);
-    }
-  }, [notify]);
-
-  const refreshConfig = useCallback(async () => {
-    const owner = currentUser.current;
-    if (!owner) return;
-    try {
-      const values = await api<Config>("/settings");
-      if (currentUser.current !== owner) return;
-      setConfig(values);
-      setEffortIndex(
-        Math.max(
-          0,
-          effortLevels.findIndex(
-            (level) => level.value === values.reasoningEffort,
-          ),
-        ),
-      );
     } catch (e) {
       notify((e as Error).message);
     }
@@ -256,6 +242,7 @@ export default function App() {
     setAttachments([]);
     setError("");
     setSettingsOpen(false);
+    setSwitchingModel(false);
     setSearch(false);
     setDeleteChat(null);
     setReferenceOpen(false);
@@ -268,7 +255,7 @@ export default function App() {
 
   function openSettings() {
     if (!user) setAuthMode("login");
-    else if (!workspaceLoading) setSettingsOpen(true);
+    else if (!workspaceLoading && !switchingModel) setSettingsOpen(true);
   }
 
   async function logout() {
@@ -398,7 +385,6 @@ export default function App() {
       performNavigate(chat.mode);
       setActiveId(chat.id);
       nearBottom.current = true;
-      if (loadedChats.current.has(chat.id)) return;
       const owner = currentUser.current;
       const request = ++chatLoadRequest.current;
       setChatLoading(true);
@@ -438,13 +424,13 @@ export default function App() {
   }
 
   async function persist(chat: Chat) {
-    await api(`/chats/${chat.id}`, {
+    return await api<{ revision: number }>(`/chats/${chat.id}`, {
       method: "PUT",
       body: JSON.stringify(chat),
     });
   }
 
-  async function runCompletion(baseChat: Chat) {
+  async function runCompletion(baseChat: Chat, resetComposer = false) {
     loadedChats.current.add(baseChat.id);
     const owner = currentUser.current;
     const assistant: Message = {
@@ -477,8 +463,17 @@ export default function App() {
     controller.current = abort;
     let streamError = "";
     let completed = false;
+    let started = false;
     try {
-      await persist({ ...chat, messages: chat.messages.slice(0, -1) });
+      const saved = await persist({
+        ...chat,
+        messages: chat.messages.slice(0, -1),
+      });
+      chat.revision = saved.revision;
+      if (resetComposer && currentUser.current === owner) {
+        setInput("");
+        setAttachments([]);
+      }
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: {
@@ -488,6 +483,9 @@ export default function App() {
         body: JSON.stringify({
           chatId: chat.id,
           assistantId: assistant.id,
+          revision: chat.revision,
+          modelId: config.activeModelId,
+          model: config.model,
           mode: chat.mode,
           reasoningEffort: effortLevels[effortIndex].value,
           messages: chat.messages.slice(0, -1).map((m) => ({
@@ -503,6 +501,7 @@ export default function App() {
         const body = await res.json();
         throw new Error(body.error || "连接失败");
       }
+      started = true;
       const reader = res.body!.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
@@ -554,12 +553,21 @@ export default function App() {
         chat.messages = chat.messages.filter((m) => m.id !== assistant.id);
       update();
       if (currentUser.current === owner) {
-        setBusy(false);
-        controller.current = null;
         try {
-          await persist(chat);
+          const saved = await api<Chat>(`/chats/${chat.id}`);
+          if (currentUser.current === owner) {
+            setChats((prev) => [
+              saved,
+              ...prev.filter((c) => c.id !== chat.id),
+            ]);
+          }
         } catch (e) {
-          notify(`保存失败：${(e as Error).message}`);
+          if (started) notify(`同步对话失败：${(e as Error).message}`);
+        } finally {
+          if (currentUser.current === owner) {
+            setBusy(false);
+            controller.current = null;
+          }
         }
       }
       if (chat.mode === "agent") refreshNotes();
@@ -573,7 +581,7 @@ export default function App() {
       setAuthMode("login");
       return;
     }
-    if (workspaceLoading || chatLoading) return;
+    if (workspaceLoading || chatLoading || switchingModel) return;
     if (!config.hasKey || !config.baseUrl || !config.model) {
       setSettingsOpen(true);
       return;
@@ -596,6 +604,7 @@ export default function App() {
     };
     const baseChat: Chat = {
       id: active?.id || uid(),
+      revision: active?.revision,
       title:
         active?.title ||
         (text || attachments[0]?.name || "图片对话")
@@ -605,9 +614,7 @@ export default function App() {
       updatedAt: new Date().toISOString(),
       messages: [...messages, userMessage],
     };
-    setInput("");
-    setAttachments([]);
-    await runCompletion(baseChat);
+    await runCompletion(baseChat, true);
   }
 
   async function regenerate() {
@@ -1165,19 +1172,30 @@ export default function App() {
       </main>
 
       {toast && (
-        <div className="toast" role="status">
-          <Check size={15} />
+        <div
+          className={`toast ${toastKind === "error" ? "toast-error" : ""}`}
+          role="status"
+        >
+          {toastKind === "error" ? (
+            <CircleAlert size={15} />
+          ) : (
+            <Check size={15} />
+          )}
           {toast}
         </div>
       )}
 
       {settingsOpen && (
         <Settings
+          key={user?.id}
           initial={config}
-          onClose={closeSettings}
-          onSaved={() => {
-            refreshConfig();
-            notify("配置已保存");
+          onClose={() => {
+            if (currentUser.current === user?.id) closeSettings();
+          }}
+          onSaved={(next, message) => {
+            if (currentUser.current !== user?.id) return;
+            setConfig(next);
+            notify(message);
           }}
         />
       )}
@@ -1496,14 +1514,78 @@ export default function App() {
             </button>
           </div>
           <div className="composer-right">
-            <button
-              className="model-select"
-              onClick={openSettings}
-              title="配置 AI 模型"
-            >
-              <span>{config.model || "选择模型"}</span>
-              <ChevronDown size={12} />
-            </button>
+            {config.profiles?.length ? (
+              <>
+                <select
+                  className="model-quick-select"
+                  aria-label="快速切换模型"
+                  value={JSON.stringify([
+                    config.activeModelId || "",
+                    config.model,
+                  ])}
+                  title={switchingModel ? "正在切换模型…" : config.model}
+                  disabled={busy || switchingModel || workspaceLoading}
+                  onChange={async (e) => {
+                    const [activeModelId, model] = JSON.parse(
+                      e.target.value,
+                    ) as [string, string];
+                    if (
+                      activeModelId === config.activeModelId &&
+                      model === config.model
+                    )
+                      return;
+                    const owner = currentUser.current;
+                    setSwitchingModel(true);
+                    try {
+                      const next = await api<Config>("/settings", {
+                        method: "PATCH",
+                        body: JSON.stringify({ activeModelId, model }),
+                      });
+                      if (currentUser.current === owner) setConfig(next);
+                    } catch (e) {
+                      if (currentUser.current === owner)
+                        notify((e as Error).message, "error");
+                    } finally {
+                      if (currentUser.current === owner)
+                        setSwitchingModel(false);
+                    }
+                  }}
+                >
+                  {config.profiles.map((p) => (
+                    <optgroup key={p.id} label={p.name} disabled={!p.hasKey}>
+                      {(p.models || [p.model]).map((model) => (
+                        <option
+                          key={model}
+                          value={JSON.stringify([p.id, model])}
+                        >
+                          {p.name === model ? model : `${p.name} · ${model}`}
+                        </option>
+                      ))}
+                    </optgroup>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  className="icon-button model-manage"
+                  aria-label="管理模型配置"
+                  title="管理模型配置"
+                  disabled={switchingModel || workspaceLoading}
+                  onClick={openSettings}
+                >
+                  <Settings2 size={15} />
+                </button>
+              </>
+            ) : (
+              <button
+                className="model-select"
+                disabled={workspaceLoading}
+                onClick={openSettings}
+                title="配置 AI 模型"
+              >
+                <span>{config.model || "选择模型"}</span>
+                <ChevronDown size={12} />
+              </button>
+            )}
             {busy ? (
               <button
                 className="send-button stop"
@@ -1521,7 +1603,8 @@ export default function App() {
                   attachmentReads > 0 ||
                   !authReady ||
                   workspaceLoading ||
-                  chatLoading
+                  chatLoading ||
+                  switchingModel
                 }
                 aria-label="发送消息"
               >

@@ -15,6 +15,7 @@ export type Chat = {
   mode: "chat" | "agent";
   messages: Message[];
   updatedAt: string;
+  revision?: number;
 };
 export type Note = {
   path: string;
@@ -25,9 +26,19 @@ export type Note = {
 };
 export type LibraryIndex = { notes: Note[]; folders: string[] };
 export type Settings = {
+  id?: string;
+  name?: string;
+  readOnly?: boolean;
+  activeModelId?: string;
+  profiles?: ModelProfile[];
   baseUrl: string;
   model: string;
+  models?: string[];
   apiKey: string;
   hasKey?: boolean;
   reasoningEffort?: ReasoningEffort;
 };
+export type ModelProfile = Omit<
+  Settings,
+  "profiles" | "activeModelId" | "reasoningEffort"
+> & { id: string; name: string };
