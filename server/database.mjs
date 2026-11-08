@@ -63,6 +63,22 @@ export async function openDatabase(dataDir) {
       throw error;
     }
   }
+  db.exec(
+    "CREATE TABLE IF NOT EXISTS generations (user_id TEXT NOT NULL, chat_id TEXT NOT NULL, state TEXT NOT NULL, PRIMARY KEY(user_id, chat_id), FOREIGN KEY(user_id, chat_id) REFERENCES chats(user_id,id) ON DELETE CASCADE)",
+  );
+  db.prepare(
+    "UPDATE generations SET state = ? WHERE json_extract(state, '$.status') = 'running'",
+  ).run(
+    JSON.stringify({
+      status: "interrupted",
+      error: "服务器已重启，任务中断，请重新生成",
+    }),
+  );
+  function setGeneration(userId, chatId, state) {
+    db.prepare(
+      "INSERT INTO generations VALUES (?, ?, ?) ON CONFLICT(user_id,chat_id) DO UPDATE SET state=excluded.state",
+    ).run(userId, chatId, JSON.stringify(state));
+  }
   function getChat(userId, id) {
     const row = db
       .prepare("SELECT * FROM chats WHERE user_id = ? AND id = ?")
@@ -74,6 +90,13 @@ export async function openDatabase(dataDir) {
       mode: row.mode,
       updatedAt: row.updated_at,
       revision: row.revision,
+      generation: JSON.parse(
+        db
+          .prepare(
+            "SELECT state FROM generations WHERE user_id=? AND chat_id=?",
+          )
+          .get(userId, id)?.state || "null",
+      ),
       messages: db
         .prepare(
           "SELECT * FROM messages WHERE user_id = ? AND chat_id = ? ORDER BY position",
@@ -167,6 +190,43 @@ export async function openDatabase(dataDir) {
     settings,
     updateSettings,
     getChat,
+    setGeneration,
+    chatPage(userId, { before, limit = 30, query = "" } = {}) {
+      const cursor = before
+        ? JSON.parse(Buffer.from(before, "base64url").toString())
+        : null;
+      if (
+        cursor &&
+        (!Array.isArray(cursor) ||
+          cursor.length !== 2 ||
+          cursor.some((v) => typeof v !== "string"))
+      )
+        throw new Error("无效的分页游标");
+      const rows = db
+        .prepare(
+          "SELECT id,title,mode,updated_at AS updatedAt FROM chats WHERE user_id=? AND instr(lower(title),lower(?))>0 AND (? IS NULL OR updated_at < ? OR (updated_at = ? AND id < ?)) ORDER BY updated_at DESC,id DESC LIMIT ?",
+        )
+        .all(
+          userId,
+          query,
+          cursor?.[0] ?? null,
+          cursor?.[0] ?? "",
+          cursor?.[0] ?? "",
+          cursor?.[1] ?? "",
+          limit + 1,
+        );
+      const items = rows.slice(0, limit);
+      const last = items.at(-1);
+      return {
+        items,
+        next:
+          rows.length > limit
+            ? Buffer.from(JSON.stringify([last.updatedAt, last.id])).toString(
+                "base64url",
+              )
+            : null,
+      };
+    },
     listChats(userId, { summary = false } = {}) {
       if (summary)
         return db
@@ -199,12 +259,50 @@ export async function openDatabase(dataDir) {
       }),
     saveAssistant: (userId, chatId, assistant) =>
       transaction(() => {
-        const current = getChat(userId, chatId);
-        if (!current) return;
-        const index = current.messages.findIndex((m) => m.id === assistant.id);
-        if (index < 0) current.messages.push(assistant);
-        else current.messages[index] = assistant;
-        writeChat(userId, { ...current, updatedAt: new Date().toISOString() });
+        if (
+          !db
+            .prepare("SELECT 1 FROM chats WHERE user_id=? AND id=?")
+            .get(userId, chatId)
+        )
+          return;
+        const existing = db
+          .prepare(
+            "SELECT position FROM messages WHERE user_id=? AND chat_id=? AND id=?",
+          )
+          .get(userId, chatId, assistant.id);
+        if (existing) {
+          db.prepare(
+            "UPDATE messages SET content=?, reasoning=?, tools=? WHERE user_id=? AND chat_id=? AND position=?",
+          ).run(
+            assistant.content,
+            assistant.reasoning ?? null,
+            JSON.stringify(assistant.tools || []),
+            userId,
+            chatId,
+            existing.position,
+          );
+        } else {
+          const position = db
+            .prepare(
+              "SELECT COALESCE(MAX(position),-1)+1 AS position FROM messages WHERE user_id=? AND chat_id=?",
+            )
+            .get(userId, chatId).position;
+          db.prepare(
+            "INSERT INTO messages (user_id,chat_id,position,id,role,content,reasoning,tools) VALUES (?,?,?,?,?,?,?,?)",
+          ).run(
+            userId,
+            chatId,
+            position,
+            assistant.id,
+            "assistant",
+            assistant.content,
+            assistant.reasoning ?? null,
+            JSON.stringify(assistant.tools || []),
+          );
+        }
+        db.prepare(
+          "UPDATE chats SET updated_at=?, revision=revision+1 WHERE user_id=? AND id=?",
+        ).run(new Date().toISOString(), userId, chatId);
       }),
     deleteChat: (userId, id) =>
       db

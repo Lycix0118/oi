@@ -5,6 +5,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import crypto from "node:crypto";
+import { fetchRetry } from "./retry.mjs";
 import { openDatabase } from "./database.mjs";
 import { validImages, modelContent } from "./images.mjs";
 import {
@@ -233,15 +234,20 @@ export async function createApp({
       );
       let response;
       try {
-        response = await fetchImpl(`${connection.baseUrl}/models`, {
-          method: "GET",
-          headers: {
-            Authorization: `Bearer ${connection.apiKey}`,
-            Accept: "application/json",
+        response = await fetchRetry(
+          fetchImpl,
+          `${connection.baseUrl}/models`,
+          {
+            method: "GET",
+            headers: {
+              Authorization: `Bearer ${connection.apiKey}`,
+              Accept: "application/json",
+            },
+            signal: AbortSignal.timeout(15000),
+            redirect: "error",
           },
-          signal: AbortSignal.timeout(15000),
-          redirect: "error",
-        });
+          connection.previous?.maxRetries ?? 2,
+        );
       } catch {
         throw new Error("获取模型列表失败，请检查接口地址、网络或稍后重试");
       }
@@ -388,7 +394,14 @@ export async function createApp({
     "/api/chats",
     route(async (req, res) =>
       res.json(
-        database.listChats(req.user.id, { summary: req.query.summary === "1" }),
+        req.query.page === "1"
+          ? database.chatPage(req.user.id, {
+              before: req.query.before,
+              query: String(req.query.q || "").slice(0, 200),
+            })
+          : database.listChats(req.user.id, {
+              summary: req.query.summary === "1",
+            }),
       ),
     ),
   );
@@ -419,7 +432,6 @@ export async function createApp({
         !chat.id ||
         typeof chat.updatedAt !== "string" ||
         !Number.isFinite(Date.parse(chat.updatedAt)) ||
-        chat.messages.length > 1000 ||
         chat.messages.some(
           (m) =>
             !m ||
@@ -462,6 +474,12 @@ export async function createApp({
     }),
   );
 
+  app.post("/api/chats/:id/stop", (req, res) => {
+    if (!database.getChat(req.user.id, req.params.id))
+      return res.status(404).json({ error: "对话不存在" });
+    generations.get(generationKey(req.user.id, req.params.id))?.abort();
+    res.json({ ok: true });
+  });
   app.post(
     "/api/chat",
     route(async (req, res) => {
@@ -488,6 +506,7 @@ export async function createApp({
       if (!["default", "low", "medium", "high"].includes(reasoningEffort))
         throw new Error("无效的思考强度");
       const agent = req.body.mode === "agent";
+      const cloud = req.body.cloud === true;
       const savedChat = req.body.chatId
         ? database.getChat(req.user.id, req.body.chatId)
         : null;
@@ -504,6 +523,7 @@ export async function createApp({
           savedChat.messages.some((m) => m.id === req.body.assistantId))
       )
         throw new Error("无效的消息标识");
+      if (cloud && !savedChat) throw new Error("云端任务需要先保存对话");
       const savedAssistant = {
         id: req.body.assistantId,
         role: "assistant",
@@ -539,15 +559,31 @@ export async function createApp({
       };
       const controller = new AbortController();
       if (savedChat) generations.set(key, controller);
-      res.on("close", () => controller.abort());
-      res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-      res.setHeader("X-Accel-Buffering", "no");
-      res.flushHeaders();
+      let outcome = "completed";
+      let failure = "";
+      if (savedChat)
+        database.setGeneration(req.user.id, savedChat.id, {
+          status: "running",
+          cloud,
+          assistantId: savedAssistant.id,
+        });
+      if (cloud) res.status(202).json({ ok: true, chatId: savedChat.id });
+      else {
+        res.on("close", () => controller.abort());
+        res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+        res.setHeader("X-Accel-Buffering", "no");
+        res.flushHeaders();
+      }
       const send = (event) => {
-        if (!res.destroyed) res.write(`data: ${JSON.stringify(event)}\n\n`);
+        if (event.type === "error") {
+          outcome = "failed";
+          failure = event.error;
+        }
+        if (!cloud && !res.destroyed)
+          res.write(`data: ${JSON.stringify(event)}\n\n`);
       };
       const heartbeat = setInterval(() => {
-        if (!res.destroyed) res.write(": keep-alive\n\n");
+        if (!cloud && !res.destroyed) res.write(": keep-alive\n\n");
       }, 15000);
       try {
         const endpoint =
@@ -563,18 +599,23 @@ export async function createApp({
               : { reasoning_effort: reasoningEffort }),
             ...(agent ? { tools: fileTools, tool_choice: "auto" } : {}),
           };
-          const upstream = await fetchImpl(endpoint, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${c.apiKey}`,
+          const upstream = await fetchRetry(
+            fetchImpl,
+            endpoint,
+            {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${c.apiKey}`,
+              },
+              body: JSON.stringify(payload),
+              signal: AbortSignal.any([
+                controller.signal,
+                AbortSignal.timeout(180000),
+              ]),
             },
-            body: JSON.stringify(payload),
-            signal: AbortSignal.any([
-              controller.signal,
-              AbortSignal.timeout(180000),
-            ]),
-          });
+            c.maxRetries ?? 2,
+          );
           if (!upstream.ok) {
             let detail = "";
             try {
@@ -652,6 +693,25 @@ export async function createApp({
           }
           if (!agent) throw new Error("普通聊天不允许调用文件工具");
           const toolCalls = [...calls.values()];
+          // Preserve protocol pairs while removing stale large tool payloads.
+          for (const message of messages) {
+            if (message.role === "tool" && message.content.length > 500)
+              message.content =
+                message.content.slice(0, 500) +
+                " [历史结果已压缩，需要时重新读取]";
+            for (const call of message.tool_calls || []) {
+              try {
+                const args = JSON.parse(call.function.arguments || "{}");
+                for (const field of ["content", "old_text", "new_text"])
+                  if (
+                    typeof args[field] === "string" &&
+                    args[field].length > 300
+                  )
+                    args[field] = "[已执行，正文省略]";
+                call.function.arguments = JSON.stringify(args);
+              } catch {}
+            }
+          }
           messages.push({
             role: "assistant",
             content: content || null,
@@ -670,6 +730,17 @@ export async function createApp({
               result = await executeTool(notesRoot, call.function.name, args);
             } catch (error) {
               result = `操作失败：${error.message}`;
+            }
+            // Completed write bodies need not be echoed to the next model call.
+            if (["write_file", "edit_file"].includes(call.function.name)) {
+              const compact = { ...args };
+              for (const field of ["content", "old_text", "new_text"])
+                if (
+                  typeof compact[field] === "string" &&
+                  compact[field].length > 300
+                )
+                  compact[field] = "[已执行，正文省略]";
+              call.function.arguments = JSON.stringify(compact);
             }
             messages.push({
               role: "tool",
@@ -711,7 +782,13 @@ export async function createApp({
           saveProgress(true);
         } finally {
           if (generations.get(key) === controller) generations.delete(key);
-          res.end();
+          if (savedChat && database.getChat(req.user.id, savedChat.id))
+            database.setGeneration(req.user.id, savedChat.id, {
+              status: controller.signal.aborted ? "stopped" : outcome,
+              cloud,
+              error: failure,
+            });
+          if (!cloud) res.end();
         }
       }
     }),

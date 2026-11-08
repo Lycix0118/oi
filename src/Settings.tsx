@@ -16,7 +16,14 @@ import type { ModelProfile, Settings as Config } from "./types";
 
 type Draft = Pick<
   ModelProfile,
-  "id" | "name" | "baseUrl" | "model" | "models" | "apiKey" | "readOnly"
+  | "id"
+  | "name"
+  | "baseUrl"
+  | "model"
+  | "models"
+  | "apiKey"
+  | "readOnly"
+  | "maxRetries"
 >;
 const emptyDraft = (id: string = uid()): Draft => ({
   id,
@@ -25,6 +32,7 @@ const emptyDraft = (id: string = uid()): Draft => ({
   model: "",
   models: [],
   apiKey: "",
+  maxRetries: 2,
 });
 const draftFrom = (p: ModelProfile): Draft => ({
   id: p.id,
@@ -34,6 +42,7 @@ const draftFrom = (p: ModelProfile): Draft => ({
   models: p.models || (p.model ? [p.model] : []),
   apiKey: "",
   readOnly: p.readOnly,
+  maxRetries: p.maxRetries ?? 2,
 });
 function normalizeUrl(value: string) {
   try {
@@ -179,6 +188,7 @@ export default function Settings({
           apiKey: values.apiKey.trim(),
           model: values.model || savedModels[0],
           models: savedModels,
+          maxRetries: values.maxRetries,
         }),
       });
       onSaved(next, "配置已保存");
@@ -263,7 +273,7 @@ export default function Settings({
             )}
           </div>
         </aside>
-        <form onSubmit={save} className="profile-editor">
+        <form onSubmit={save} className="profile-editor" autoComplete="off">
           <div className="profile-editor-header">
             <h3>
               {original ? "配置详情" : "新增配置"}
@@ -352,7 +362,17 @@ export default function Settings({
               <div className="password-input">
                 <input
                   aria-label="API Key"
-                  type={visible ? "text" : "password"}
+                  type="text"
+                  name="provider-api-token"
+                  data-lpignore="true"
+                  data-1p-ignore="true"
+                  spellCheck={false}
+                  autoCapitalize="none"
+                  style={
+                    {
+                      WebkitTextSecurity: visible ? "none" : "disc",
+                    } as React.CSSProperties
+                  }
                   value={values.apiKey}
                   onChange={(e) => {
                     update({ apiKey: e.target.value });
@@ -374,6 +394,24 @@ export default function Settings({
                   {visible ? <EyeOff size={16} /> : <Eye size={16} />}
                 </button>
               </div>
+            </label>
+            <label className="field-group">
+              <span className="field-label">最大重试次数（0–10）</span>
+              <input
+                className="field-input"
+                type="number"
+                min={0}
+                max={10}
+                step={1}
+                required
+                value={values.maxRetries ?? 2}
+                disabled={busy || values.readOnly}
+                onChange={(e) => update({ maxRetries: Number(e.target.value) })}
+              />
+              <small>
+                默认重试 2
+                次；仅在开始输出前重试临时网络错误，避免重复输出或执行工具。
+              </small>
             </label>
             {!values.readOnly && (
               <section className="model-discovery" aria-label="API 可用模型">

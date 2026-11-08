@@ -15,6 +15,7 @@ import {
   ChevronDown,
   ChevronRight,
   CircleAlert,
+  Cloud,
   Copy,
   FileText,
   LibraryBig,
@@ -89,6 +90,19 @@ export default function App() {
   >([]);
   const [attachmentReads, setAttachmentReads] = useState(0);
   const [busy, setBusy] = useState(false);
+  const [cloud, setCloud] = useState(
+    () => localStorage.getItem("oi-cloud") === "1",
+  );
+  const [historyNext, setHistoryNext] = useState<string | null>(null);
+  const [historyBusy, setHistoryBusy] = useState(false);
+  const [searchChats, setSearchChats] = useState<Chat[]>([]);
+  const [searchNext, setSearchNext] = useState<string | null>(null);
+  const [searchBusy, setSearchBusy] = useState(false);
+  const searchVersion = useRef(0);
+  const [messageLimit, setMessageLimit] = useState(40);
+  const [editingMessage, setEditingMessage] = useState<Message | null>(null);
+  const [editText, setEditText] = useState("");
+  const [messageSaving, setMessageSaving] = useState(false);
   const [effortIndex, setEffortIndex] = useState(0);
   const [toast, setToast] = useState("");
   const [toastKind, setToastKind] = useState<"success" | "error">("success");
@@ -196,14 +210,17 @@ export default function App() {
     Promise.all([
       api<LibraryIndex>("/library"),
       api<Config>("/settings"),
-      api<Omit<Chat, "messages">[]>("/chats?summary=1"),
+      api<{ items: Omit<Chat, "messages">[]; next: string | null }>(
+        "/chats?page=1",
+      ),
     ])
       .then(([nextNotes, nextConfig, nextChats]) => {
         if (cancelled || currentUser.current !== owner) return;
         setNotes(nextNotes.notes);
         setFolderPaths(nextNotes.folders);
         setConfig(nextConfig);
-        setChats(nextChats.map((chat) => ({ ...chat, messages: [] })));
+        setChats(nextChats.items.map((chat) => ({ ...chat, messages: [] })));
+        setHistoryNext(nextChats.next);
         setEffortIndex(
           Math.max(
             0,
@@ -236,6 +253,8 @@ export default function App() {
     setFolderPaths([]);
     setNotes([]);
     setActiveId(null);
+    setHistoryNext(null);
+    setEditingMessage(null);
     setConfig({ baseUrl: "", model: "", apiKey: "" });
     setEffortIndex(0);
     setInput("");
@@ -383,7 +402,11 @@ export default function App() {
     if (busy) return;
     requestNavigation(() => {
       performNavigate(chat.mode);
+      setChats((prev) =>
+        prev.some((c) => c.id === chat.id) ? prev : [...prev, chat],
+      );
       setActiveId(chat.id);
+      setMessageLimit(40);
       nearBottom.current = true;
       const owner = currentUser.current;
       const request = ++chatLoadRequest.current;
@@ -396,6 +419,7 @@ export default function App() {
           )
             return;
           loadedChats.current.add(value.id);
+          if (value.generation?.error) setError(value.generation.error);
           setChats((previous) =>
             previous.map((item) => (item.id === value.id ? value : item)),
           );
@@ -422,6 +446,133 @@ export default function App() {
       setNotePath(path);
     });
   }
+
+  async function loadSearch(before?: string, version = searchVersion.current) {
+    const owner = currentUser.current;
+    setSearchBusy(true);
+    try {
+      const page = await api<{
+        items: Omit<Chat, "messages">[];
+        next: string | null;
+      }>(
+        "/chats?page=1&q=" +
+          encodeURIComponent(query) +
+          (before ? "&before=" + encodeURIComponent(before) : ""),
+      );
+      if (owner !== currentUser.current || version !== searchVersion.current)
+        return;
+      const items = page.items.map((c) => ({ ...c, messages: [] }));
+      setSearchChats((prev) =>
+        before
+          ? [...prev, ...items.filter((c) => !prev.some((p) => p.id === c.id))]
+          : items,
+      );
+      setSearchNext(page.next);
+    } catch (e) {
+      if (owner === currentUser.current) notify((e as Error).message);
+    } finally {
+      if (version === searchVersion.current) setSearchBusy(false);
+    }
+  }
+  useEffect(() => {
+    const version = ++searchVersion.current;
+    setSearchChats([]);
+    setSearchNext(null);
+    if (!search || !user) return;
+    const timer = setTimeout(() => void loadSearch(undefined, version), 250);
+    return () => clearTimeout(timer);
+  }, [query, search, user?.id]);
+
+  async function loadHistory() {
+    if (!historyNext || historyBusy) return;
+    const owner = currentUser.current;
+    setHistoryBusy(true);
+    try {
+      const page = await api<{
+        items: Omit<Chat, "messages">[];
+        next: string | null;
+      }>("/chats?page=1&before=" + encodeURIComponent(historyNext));
+      if (owner !== currentUser.current) return;
+      setChats((prev) => [
+        ...prev,
+        ...page.items
+          .filter((c) => !prev.some((p) => p.id === c.id))
+          .map((c) => ({ ...c, messages: [] })),
+      ]);
+      setHistoryNext(page.next);
+    } catch (e) {
+      notify((e as Error).message);
+    } finally {
+      setHistoryBusy(false);
+    }
+  }
+  async function changeMessage(id: string, content: string | null) {
+    if (!active || busy || messageSaving) return;
+    const owner = currentUser.current;
+    setMessageSaving(true);
+    try {
+      const next = {
+        ...active,
+        messages:
+          content === null
+            ? active.messages.filter((m) => m.id !== id)
+            : active.messages.map((m) => (m.id === id ? { ...m, content } : m)),
+      };
+      const saved = await persist(next);
+      if (owner !== currentUser.current) return;
+      setChats((prev) =>
+        prev.map((c) =>
+          c.id === next.id ? { ...next, revision: saved.revision } : c,
+        ),
+      );
+      setEditingMessage(null);
+    } catch (e) {
+      notify((e as Error).message);
+    } finally {
+      setMessageSaving(false);
+    }
+  }
+  useEffect(() => {
+    if (!activeId || !user || active?.generation?.status !== "running") return;
+    const owner = user.id;
+    const id = activeId;
+    let cancelled = false;
+    setBusy(true);
+    let inFlight = false;
+    const tick = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        const chat = await api<Chat>("/chats/" + encodeURIComponent(id));
+        if (cancelled || currentUser.current !== owner) return;
+        setChats((prev) => prev.map((c) => (c.id === id ? chat : c)));
+        if (chat.generation?.status !== "running") {
+          setBusy(false);
+          if (chat.generation?.error) setError(chat.generation.error);
+          if (chat.mode === "agent") void refreshNotes();
+        }
+      } catch (error) {
+        if (
+          !cancelled &&
+          currentUser.current === owner &&
+          (error as Error & { status?: number }).status === 404
+        ) {
+          setBusy(false);
+          setActiveId(null);
+          notify("对话已被删除");
+        }
+        /* Keep polling after temporary connectivity loss. */
+      } finally {
+        inFlight = false;
+      }
+    };
+    const timer = setInterval(() => void tick(), 1500);
+    void tick();
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [activeId, user?.id, active?.generation?.status]);
 
   async function persist(chat: Chat) {
     return await api<{ revision: number }>(`/chats/${chat.id}`, {
@@ -464,6 +615,7 @@ export default function App() {
     let streamError = "";
     let completed = false;
     let started = false;
+    let cloudRunning = false;
     try {
       const saved = await persist({
         ...chat,
@@ -473,6 +625,31 @@ export default function App() {
       if (resetComposer && currentUser.current === owner) {
         setInput("");
         setAttachments([]);
+      }
+      if (cloud) {
+        await api("/chat", {
+          method: "POST",
+          body: JSON.stringify({
+            chatId: chat.id,
+            assistantId: assistant.id,
+            revision: chat.revision,
+            modelId: config.activeModelId,
+            model: config.model,
+            mode: chat.mode,
+            cloud: true,
+            reasoningEffort: effortLevels[effortIndex].value,
+            messages: baseChat.messages.map((m) => ({
+              role: m.role,
+              content: m.content,
+              images: m.images,
+            })),
+          }),
+        });
+        started = true;
+        cloudRunning = true;
+        chat.generation = { status: "running", cloud: true };
+        completed = true;
+        return;
       }
       const res = await fetch("/api/chat", {
         method: "POST",
@@ -556,6 +733,8 @@ export default function App() {
         try {
           const saved = await api<Chat>(`/chats/${chat.id}`);
           if (currentUser.current === owner) {
+            cloudRunning = saved.generation?.status === "running";
+            if (saved.generation?.error) setError(saved.generation.error);
             setChats((prev) => [
               saved,
               ...prev.filter((c) => c.id !== chat.id),
@@ -565,7 +744,7 @@ export default function App() {
           if (started) notify(`同步对话失败：${(e as Error).message}`);
         } finally {
           if (currentUser.current === owner) {
-            setBusy(false);
+            setBusy(cloudRunning);
             controller.current = null;
           }
         }
@@ -721,9 +900,7 @@ export default function App() {
   const closeDeleteChat = useCallback(() => setDeleteChat(null), []);
 
   const visibleChats = chats.filter((c) => c.mode === mode);
-  const searchedChats = chats.filter((c) =>
-    c.title.toLowerCase().includes(query.toLowerCase()),
-  );
+  const searchedChats = searchChats;
   const searchedNotes = notes.filter((n) =>
     `${n.title} ${n.path} ${n.excerpt}`
       .toLowerCase()
@@ -806,7 +983,7 @@ export default function App() {
         <div className="nav-label">历史对话</div>
         <div className="history-list">
           {visibleChats.length ? (
-            visibleChats.slice(0, 20).map((c) => (
+            visibleChats.map((c) => (
               <div
                 className={`history-item ${c.id === activeId ? "selected" : ""}`}
                 key={c.id}
@@ -827,6 +1004,15 @@ export default function App() {
             ))
           ) : (
             <div className="empty-history">暂无记录</div>
+          )}
+          {historyNext && (
+            <button
+              className="secondary-button"
+              disabled={historyBusy}
+              onClick={() => loadHistory()}
+            >
+              {historyBusy ? "加载中…" : "加载更早对话"}
+            </button>
           )}
         </div>
 
@@ -964,159 +1150,201 @@ export default function App() {
                 </div>
               ) : (
                 <div className="conversation">
-                  {messages.map((m, index) => (
-                    <div className={`message message-${m.role}`} key={m.id}>
-                      {m.role === "assistant" && (
-                        <div className="assistant-avatar">
-                          <Logo small />
-                        </div>
-                      )}
-                      <div className="message-body">
-                        {m.reasoning && (
-                          <details className="reasoning-block">
-                            <summary>
-                              <BrainCircuit size={13} />
-                              <span>思考过程</span>
-                              <ChevronDown size={12} />
-                            </summary>
-                            <pre>{m.reasoning}</pre>
-                          </details>
+                  {messages.length > messageLimit && (
+                    <button
+                      className="secondary-button"
+                      onClick={() => {
+                        nearBottom.current = false;
+                        setMessageLimit((n) => n + 40);
+                      }}
+                    >
+                      加载更早消息（剩余 {messages.length - messageLimit} 条）
+                    </button>
+                  )}
+                  {messages.slice(-messageLimit).map((m, localIndex) => {
+                    const index =
+                      Math.max(0, messages.length - messageLimit) + localIndex;
+                    return (
+                      <div className={`message message-${m.role}`} key={m.id}>
+                        {m.role === "assistant" && (
+                          <div className="assistant-avatar">
+                            <Logo small />
+                          </div>
                         )}
-                        {m.tools && m.tools.length > 0 && (
-                          <div className="tool-list">
-                            {m.tools.map((t, i) => (
-                              <details className="tool-call" key={i}>
-                                <summary>
-                                  <span
-                                    className={
-                                      t.result.startsWith("操作失败")
-                                        ? "tool-error"
-                                        : ""
-                                    }
-                                  >
-                                    {t.result.startsWith("操作失败") ? (
-                                      <CircleAlert size={14} />
-                                    ) : (
-                                      <Check size={14} />
-                                    )}
-                                  </span>
-                                  <span>
-                                    {{
-                                      list_files: "浏览知识库",
-                                      read_file: "读取文件",
-                                      write_file: "保存文件",
-                                      edit_file: "修改文件",
-                                    }[t.name] || t.name}
-                                  </span>
-                                  {t.path && (
-                                    <button
-                                      onClick={(e) => {
-                                        e.preventDefault();
-                                        if (!busy) openNote(t.path!);
-                                      }}
+                        <div className="message-body">
+                          {m.reasoning && (
+                            <details className="reasoning-block">
+                              <summary>
+                                <BrainCircuit size={13} />
+                                <span>思考过程</span>
+                                <ChevronDown size={12} />
+                              </summary>
+                              <pre>{m.reasoning}</pre>
+                            </details>
+                          )}
+                          {m.tools && m.tools.length > 0 && (
+                            <div className="tool-list">
+                              {m.tools.map((t, i) => (
+                                <details className="tool-call" key={i}>
+                                  <summary>
+                                    <span
+                                      className={
+                                        t.result.startsWith("操作失败")
+                                          ? "tool-error"
+                                          : ""
+                                      }
                                     >
-                                      {t.path}
-                                    </button>
-                                  )}
-                                  <ChevronDown size={12} />
-                                </summary>
-                                <pre>{t.result}</pre>
-                              </details>
-                            ))}
-                          </div>
-                        )}
-                        {m.images && m.images.length > 0 && (
-                          <div className="message-images">
-                            {m.images.map((image, i) => (
-                              <img
-                                key={i}
-                                src={image.dataUrl}
-                                alt={image.name}
-                              />
-                            ))}
-                          </div>
-                        )}
-                        {m.content ? (
-                          <Markdown content={m.content} />
-                        ) : busy && index === messages.length - 1 ? (
-                          <div className="typing-indicator">
-                            <span />
-                            <span />
-                            <span />
-                          </div>
-                        ) : null}
-                        {m.role === "assistant" &&
-                          m.content &&
-                          !(busy && index === messages.length - 1) && (
-                            <div className="message-actions">
-                              <button
-                                onClick={async () => {
-                                  try {
-                                    await navigator.clipboard.writeText(
-                                      m.content,
-                                    );
-                                    setCopiedId(m.id);
-                                    setTimeout(() => setCopiedId(""), 1600);
-                                  } catch {
-                                    notify("复制失败");
-                                  }
-                                }}
-                                aria-label="复制回复"
-                              >
-                                {copiedId === m.id ? (
-                                  <Check size={13} />
-                                ) : (
-                                  <Copy size={13} />
-                                )}
-                                <span>
-                                  {copiedId === m.id ? "已复制" : "复制"}
-                                </span>
-                              </button>
-                              <button
-                                onClick={async () => {
-                                  try {
-                                    const title =
-                                      m.content
-                                        .match(/^#\s+(.+)/m)?.[1]
-                                        ?.replace(/[<>:"/\\|?*]/g, "")
-                                        .slice(0, 60) ||
-                                      active?.title
-                                        ?.replace(/[<>:"/\\|?*]/g, "")
-                                        .slice(0, 60) ||
-                                      "对话笔记";
-                                    const path = `对话笔记/${title}-${Date.now().toString(36)}.md`;
-                                    await api("/note", {
-                                      method: "PUT",
-                                      body: JSON.stringify({
-                                        path,
-                                        content: m.content,
-                                        createOnly: true,
-                                      }),
-                                    });
-                                    refreshNotes();
-                                    notify("已保存到知识库");
-                                  } catch (e) {
-                                    notify((e as Error).message);
-                                  }
-                                }}
-                              >
-                                <BookOpen size={13} />
-                                <span>存为笔记</span>
-                              </button>
-                              {index === messages.length - 1 && (
-                                <button
-                                  onClick={regenerate}
-                                  aria-label="重新生成"
-                                >
-                                  <RotateCcw size={13} />
-                                  <span>重试</span>
-                                </button>
-                              )}
+                                      {t.result.startsWith("操作失败") ? (
+                                        <CircleAlert size={14} />
+                                      ) : (
+                                        <Check size={14} />
+                                      )}
+                                    </span>
+                                    <span>
+                                      {{
+                                        list_files: "浏览知识库",
+                                        read_file: "读取文件",
+                                        write_file: "保存文件",
+                                        edit_file: "修改文件",
+                                      }[t.name] || t.name}
+                                    </span>
+                                    {t.path && (
+                                      <button
+                                        onClick={(e) => {
+                                          e.preventDefault();
+                                          if (!busy) openNote(t.path!);
+                                        }}
+                                      >
+                                        {t.path}
+                                      </button>
+                                    )}
+                                    <ChevronDown size={12} />
+                                  </summary>
+                                  <pre>{t.result}</pre>
+                                </details>
+                              ))}
                             </div>
                           )}
+                          {m.images && m.images.length > 0 && (
+                            <div className="message-images">
+                              {m.images.map((image, i) => (
+                                <img
+                                  key={i}
+                                  src={image.dataUrl}
+                                  alt={image.name}
+                                />
+                              ))}
+                            </div>
+                          )}
+                          {m.content ? (
+                            <Markdown content={m.content} />
+                          ) : busy && index === messages.length - 1 ? (
+                            <div className="typing-indicator">
+                              <span />
+                              <span />
+                              <span />
+                            </div>
+                          ) : null}
+                          {!busy &&
+                            active?.generation?.status !== "running" && (
+                              <div className="message-actions">
+                                <button
+                                  disabled={messageSaving}
+                                  onClick={() => {
+                                    setEditingMessage(m);
+                                    setEditText(m.content);
+                                  }}
+                                  aria-label="编辑消息"
+                                >
+                                  <PenLine size={13} />
+                                  编辑
+                                </button>
+                                <button
+                                  disabled={messageSaving}
+                                  onClick={() => {
+                                    if (confirm("确定永久删除这条消息？"))
+                                      void changeMessage(m.id, null);
+                                  }}
+                                  aria-label="删除消息"
+                                >
+                                  <Trash2 size={13} />
+                                  删除
+                                </button>
+                              </div>
+                            )}
+                          {m.role === "assistant" &&
+                            m.content &&
+                            !(busy && index === messages.length - 1) && (
+                              <div className="message-actions">
+                                <button
+                                  onClick={async () => {
+                                    try {
+                                      await navigator.clipboard.writeText(
+                                        m.content,
+                                      );
+                                      setCopiedId(m.id);
+                                      setTimeout(() => setCopiedId(""), 1600);
+                                    } catch {
+                                      notify("复制失败");
+                                    }
+                                  }}
+                                  aria-label="复制回复"
+                                >
+                                  {copiedId === m.id ? (
+                                    <Check size={13} />
+                                  ) : (
+                                    <Copy size={13} />
+                                  )}
+                                  <span>
+                                    {copiedId === m.id ? "已复制" : "复制"}
+                                  </span>
+                                </button>
+                                <button
+                                  onClick={async () => {
+                                    try {
+                                      const title =
+                                        m.content
+                                          .match(/^#\s+(.+)/m)?.[1]
+                                          ?.replace(/[<>:"/\\|?*]/g, "")
+                                          .slice(0, 60) ||
+                                        active?.title
+                                          ?.replace(/[<>:"/\\|?*]/g, "")
+                                          .slice(0, 60) ||
+                                        "对话笔记";
+                                      const path = `对话笔记/${title}-${Date.now().toString(36)}.md`;
+                                      await api("/note", {
+                                        method: "PUT",
+                                        body: JSON.stringify({
+                                          path,
+                                          content: m.content,
+                                          createOnly: true,
+                                        }),
+                                      });
+                                      refreshNotes();
+                                      notify("已保存到知识库");
+                                    } catch (e) {
+                                      notify((e as Error).message);
+                                    }
+                                  }}
+                                >
+                                  <BookOpen size={13} />
+                                  <span>存为笔记</span>
+                                </button>
+                                {index === messages.length - 1 && (
+                                  <button
+                                    onClick={regenerate}
+                                    aria-label="重新生成"
+                                  >
+                                    <RotateCcw size={13} />
+                                    <span>重试</span>
+                                  </button>
+                                )}
+                              </div>
+                            )}
+                        </div>
                       </div>
-                    </div>
-                  ))}
+                    );
+                  })}
                   {error && (
                     <div className="chat-error" role="alert">
                       <CircleAlert size={16} />
@@ -1171,6 +1399,34 @@ export default function App() {
         )}
       </main>
 
+      {editingMessage && (
+        <Modal
+          title="编辑消息"
+          onClose={() => {
+            if (!messageSaving) setEditingMessage(null);
+          }}
+        >
+          <textarea
+            className="field-input message-editor"
+            aria-label="消息内容"
+            rows={12}
+            value={editText}
+            onChange={(e) => setEditText(e.target.value)}
+            disabled={messageSaving}
+          />
+          <p>保存后，后续对话将使用修改后的内容。已有回复不会自动重新生成。</p>
+          <button
+            className="primary-button"
+            disabled={
+              messageSaving ||
+              (!editText.trim() && !editingMessage.images?.length)
+            }
+            onClick={() => void changeMessage(editingMessage.id, editText)}
+          >
+            保存修改
+          </button>
+        </Modal>
+      )}
       {toast && (
         <div
           className={`toast ${toastKind === "error" ? "toast-error" : ""}`}
@@ -1259,9 +1515,19 @@ export default function App() {
                   <ArrowRight size={14} />
                 </button>
               ))}
-              {!searchedNotes.length && !searchedChats.length && (
-                <div className="search-empty">无匹配结果</div>
+              {searchNext && (
+                <button
+                  disabled={searchBusy}
+                  onClick={() => void loadSearch(searchNext)}
+                >
+                  {searchBusy ? "加载中…" : "加载更多对话"}
+                </button>
               )}
+              {!searchBusy &&
+                !searchedNotes.length &&
+                !searchedChats.length && (
+                  <div className="search-empty">无匹配结果</div>
+                )}
             </div>
           </div>
         </Modal>
@@ -1514,6 +1780,26 @@ export default function App() {
             </button>
           </div>
           <div className="composer-right">
+            <label
+              className={`cloud-switch ${busy ? "disabled" : ""}`}
+              title="使用服务器网络，关闭网页后继续生成；服务器必须持续运行"
+            >
+              <input
+                type="checkbox"
+                aria-label="使用云端"
+                checked={cloud}
+                disabled={busy}
+                onChange={() => {
+                  setCloud(!cloud);
+                  localStorage.setItem("oi-cloud", cloud ? "0" : "1");
+                }}
+              />
+              <span className="cloud-track" aria-hidden="true">
+                <Cloud size={11} className="cloud-track-icon" />
+                <span className="cloud-thumb" />
+              </span>
+              <span className="cloud-label">云端</span>
+            </label>
             {config.profiles?.length ? (
               <>
                 <select
@@ -1589,7 +1875,13 @@ export default function App() {
             {busy ? (
               <button
                 className="send-button stop"
-                onClick={() => controller.current?.abort()}
+                onClick={() => {
+                  if (active?.generation?.status === "running")
+                    void api("/chats/" + active.id + "/stop", {
+                      method: "POST",
+                    }).catch((e) => notify(e.message));
+                  else controller.current?.abort();
+                }}
                 aria-label="停止生成"
               >
                 <Square size={13} fill="currentColor" />

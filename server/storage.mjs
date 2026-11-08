@@ -157,7 +157,10 @@ export const fileTools = [
       description: "列出所有用户共享的知识库中的 Markdown 文件路径和标题。",
       parameters: {
         type: "object",
-        properties: {},
+        properties: {
+          offset: { type: "integer", minimum: 0 },
+          limit: { type: "integer", minimum: 1, maximum: 100 },
+        },
         additionalProperties: false,
       },
     },
@@ -166,10 +169,13 @@ export const fileTools = [
     type: "function",
     function: {
       name: "read_file",
-      description: "读取知识库中指定 Markdown 文件，修改前请先读取。",
+      description:
+        "分页读取 Markdown，默认最多 12000 字符，按 nextOffset 继续读取。局部修改优先使用 edit_file。",
       parameters: {
         type: "object",
         properties: {
+          offset: { type: "integer", minimum: 0 },
+          limit: { type: "integer", minimum: 1, maximum: 20000 },
           path: {
             type: "string",
             description: "知识库相对路径，例如 基础算法/二分查找.md",
@@ -214,7 +220,22 @@ export const fileTools = [
 ];
 
 export async function executeTool(root, name, args) {
-  if (name === "list_files") return JSON.stringify(await listNotes(root));
+  if (name === "list_files") {
+    const notes = await listNotes(root);
+    const offset = Number.isInteger(args?.offset)
+      ? Math.max(0, args.offset)
+      : 0;
+    const limit = Number.isInteger(args?.limit)
+      ? Math.min(100, Math.max(1, args.limit))
+      : 50;
+    return JSON.stringify({
+      files: notes
+        .slice(offset, offset + limit)
+        .map(({ path, title }) => ({ path, title })),
+      total: notes.length,
+      nextOffset: offset + limit < notes.length ? offset + limit : null,
+    });
+  }
   if (!args || typeof args !== "object" || Array.isArray(args))
     throw new Error("文件操作参数必须是对象");
   if (!["read_file", "write_file", "edit_file"].includes(name))
@@ -222,9 +243,18 @@ export async function executeTool(root, name, args) {
   const file = await notePath(root, args.path);
   if (name === "read_file") {
     const content = await fs.readFile(file, "utf8");
-    if (content.length > 150000)
-      throw new Error("文件过大，请拆分文章后再读取");
-    return content;
+    const offset = Number.isInteger(args.offset) ? Math.max(0, args.offset) : 0;
+    const limit = Number.isInteger(args.limit)
+      ? Math.min(20000, Math.max(1, args.limit))
+      : 12000;
+    if (offset === 0 && content.length <= limit) return content;
+    return JSON.stringify({
+      path: args.path,
+      content: content.slice(offset, offset + limit),
+      offset,
+      total: content.length,
+      nextOffset: offset + limit < content.length ? offset + limit : null,
+    });
   }
   let content = args.content;
   if (name === "edit_file") {

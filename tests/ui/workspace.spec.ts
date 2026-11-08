@@ -250,7 +250,9 @@ test("model configuration keeps current selection, protects edits and isolates k
   await page.getByRole("button", { name: "显示密钥", exact: true }).click();
   await page.getByRole("button", { name: "新增配置", exact: true }).click();
   const key = page.getByLabel("API Key", { exact: true });
-  await expect(key).toHaveAttribute("type", "password");
+  await expect(key).toHaveAttribute("type", "text");
+  await expect(key).toHaveAttribute("autocomplete", "off");
+  await expect(key).toHaveCSS("-webkit-text-security", "disc");
   await expect(key).toHaveAttribute("placeholder", "输入 API Key");
   await expect(key).toHaveAttribute("required", "");
   await page.getByRole("button", { name: "取消", exact: true }).click();
@@ -1289,5 +1291,117 @@ test("nested folders support browsing, creating, renaming and recursive deletion
     page
       .locator(".windows-explorer")
       .getByRole("button", { name: root, exact: true }),
+  ).toHaveCount(0);
+});
+
+test("messages can be edited and deleted and cloud option persists on mobile", async ({
+  page,
+}) => {
+  const id = "editable";
+  await page.request.put("/api/chats/" + id, {
+    data: {
+      id,
+      title: "editable-history",
+      mode: "chat",
+      updatedAt: new Date().toISOString(),
+      messages: [
+        { id: "u", role: "user", content: "old question" },
+        { id: "a", role: "assistant", content: "old answer" },
+      ],
+    },
+  });
+  await page.goto("/");
+  await page
+    .getByRole("button", { name: "editable-history", exact: true })
+    .click();
+  await page
+    .getByRole("button", { name: "编辑消息", exact: true })
+    .first()
+    .click();
+  await page.getByRole("textbox", { name: "消息内容" }).fill("edited question");
+  await page.getByRole("button", { name: "保存修改", exact: true }).click();
+  await expect(page.locator(".message-user")).toContainText("edited question");
+  page.once("dialog", (dialog) => dialog.accept());
+  await page
+    .getByRole("button", { name: "删除消息", exact: true })
+    .last()
+    .click();
+  await expect(page.locator(".message-assistant")).toHaveCount(0);
+  await page.getByRole("checkbox", { name: "使用云端" }).check();
+  await page.reload();
+  await expect(page.getByRole("checkbox", { name: "使用云端" })).toBeChecked();
+  await page
+    .getByRole("button", { name: "editable-history", exact: true })
+    .click();
+  await expect(page.locator(".message-user")).toContainText("edited question");
+  await expect(page.locator(".message-assistant")).toHaveCount(0);
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth,
+    ),
+  ).toBe(true);
+  await page.screenshot({
+    path: "test-results/cloud-messages-mobile.png",
+    fullPage: true,
+  });
+});
+
+test("cloud accepted jobs are polled and recovered after reload", async ({
+  page,
+}) => {
+  await page.request.put("/api/settings", {
+    data: {
+      id: "cloud",
+      baseUrl: "https://model.invalid/v1",
+      model: "cloud-model",
+      apiKey: "secret",
+      maxRetries: 3,
+    },
+  });
+  let jobId = "";
+  let finished = false;
+  await page.route("**/api/chat", async (route) => {
+    const body = route.request().postDataJSON();
+    expect(body.cloud).toBe(true);
+    jobId = body.chatId;
+    await route.fulfill({ status: 202, json: { ok: true, chatId: jobId } });
+  });
+  await page.route("**/api/chats/*", async (route) => {
+    if (route.request().method() !== "GET" || !jobId) return route.continue();
+    const response = await route.fetch();
+    const chat = await response.json();
+    chat.generation = {
+      cloud: true,
+      status: finished ? "completed" : "running",
+    };
+    if (finished)
+      chat.messages.push({
+        id: "reply",
+        role: "assistant",
+        content: "cloud completed",
+      });
+    await route.fulfill({ json: chat });
+  });
+  await page.goto("/");
+  await page.getByRole("checkbox", { name: "使用云端" }).check();
+  await page
+    .getByRole("textbox", { name: "发送题目或问题" })
+    .fill("cloud task");
+  await page.getByRole("button", { name: "发送消息", exact: true }).click();
+  await expect(
+    page.getByRole("button", { name: "停止生成", exact: true }),
+  ).toBeVisible();
+  await page.reload();
+  await page.getByRole("button", { name: "cloud task", exact: true }).click();
+  await expect(
+    page.getByRole("button", { name: "停止生成", exact: true }),
+  ).toBeVisible();
+  finished = true;
+  await expect(page.locator(".message-assistant")).toContainText(
+    "cloud completed",
+  );
+  await expect(
+    page.getByRole("button", { name: "停止生成", exact: true }),
   ).toHaveCount(0);
 });

@@ -16,6 +16,7 @@ export type Chat = {
   messages: Message[];
   updatedAt: string;
   revision?: number;
+  generation?: { status: string; cloud?: boolean; error?: string } | null;
 };
 export type Note = {
   path: string;
@@ -35,6 +36,7 @@ export type Settings = {
   model: string;
   models?: string[];
   apiKey: string;
+  maxRetries?: number;
   hasKey?: boolean;
   reasoningEffort?: ReasoningEffort;
 };

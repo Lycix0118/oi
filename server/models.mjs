@@ -150,7 +150,14 @@ export function saveModel(stored, body) {
     model: model.trim(),
     models,
     apiKey,
+    maxRetries: body.maxRetries ?? previous?.maxRetries ?? 2,
   };
+  if (
+    !Number.isInteger(saved.maxRetries) ||
+    saved.maxRetries < 0 ||
+    saved.maxRetries > 10
+  )
+    throw new Error("最大重试次数必须为 0–10 的整数");
   const selected = resolveModel(stored);
   return {
     profiles: previous

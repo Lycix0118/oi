@@ -1682,3 +1682,313 @@ test("invalid Agent tool arguments return a tool error and preserve the stream",
   assert.match(output, /文件操作参数必须是对象/);
   assert.match(output, /"type":"done"/);
 });
+
+test("cloud task survives accepted response, enforces ownership and can be stopped", async (t) => {
+  let release;
+  let aborted = false;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const { request, client } = await fixture(t, async (_url, init) => {
+    await gate;
+    return new Response(
+      new ReadableStream({
+        start(controller) {
+          init.signal.addEventListener("abort", () => {
+            aborted = true;
+            controller.error(new Error("aborted"));
+          });
+          controller.enqueue(
+            new TextEncoder().encode(
+              "data: " +
+                JSON.stringify({
+                  choices: [{ delta: { content: "cloud reply" } }],
+                }) +
+                "\n\n",
+            ),
+          );
+        },
+      }),
+    );
+  });
+  await request("/settings", "PUT", {
+    id: "cloud-model",
+    baseUrl: "https://model.invalid/v1",
+    model: "test",
+    apiKey: "secret",
+    maxRetries: 0,
+  });
+  const chat = {
+    id: "cloud-job",
+    title: "Cloud",
+    mode: "agent",
+    updatedAt: new Date().toISOString(),
+    messages: [{ id: "q", role: "user", content: "hello" }],
+  };
+  const saved = await (await request("/chats/cloud-job", "PUT", chat)).json();
+  const response = await request("/chat", "POST", {
+    chatId: chat.id,
+    assistantId: "a",
+    revision: saved.revision,
+    cloud: true,
+    mode: "agent",
+    messages: chat.messages,
+  });
+  assert.equal(response.status, 202);
+  assert.equal(
+    (await (await request("/chats/cloud-job")).json()).generation.status,
+    "running",
+  );
+  assert.equal(
+    (
+      await request("/chats/cloud-job", "PUT", {
+        ...chat,
+        revision: saved.revision,
+      })
+    ).status,
+    409,
+  );
+  const other = client();
+  await other("/auth/register", "POST", {
+    username: "other-cloud",
+    password: "password123",
+  });
+  assert.equal((await other("/chats/cloud-job/stop", "POST")).status, 404);
+  release();
+  for (let i = 0; i < 50; i++) {
+    if (
+      (await (await request("/chats/cloud-job")).json()).messages.length === 2
+    )
+      break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(
+    (await (await request("/chats/cloud-job")).json()).messages[1].content,
+    "cloud reply",
+  );
+  await request("/chats/cloud-job/stop", "POST");
+  for (let i = 0; i < 50; i++) {
+    if (
+      (await (await request("/chats/cloud-job")).json()).generation.status ===
+      "stopped"
+    )
+      break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(aborted, true);
+  assert.equal(
+    (await (await request("/chats/cloud-job")).json()).generation.status,
+    "stopped",
+  );
+});
+
+test("history pages have no age cutoff and message edits and deletes persist", async (t) => {
+  const { request, restart } = await fixture(t);
+  for (let i = 0; i < 35; i++)
+    assert.equal(
+      (
+        await request("/chats/h" + i, "PUT", {
+          id: "h" + i,
+          title: "history " + i,
+          mode: "chat",
+          updatedAt: "2000-01-01",
+          messages: [{ id: "m", role: "user", content: "original" }],
+        })
+      ).status,
+      200,
+    );
+  const first = await (await request("/chats?page=1")).json();
+  assert.equal(first.items.length, 30);
+  const second = await (
+    await request("/chats?page=1&before=" + first.next)
+  ).json();
+  assert.equal(second.items.length, 5);
+  assert.equal(
+    new Set([...first.items, ...second.items].map((c) => c.id)).size,
+    35,
+  );
+  assert.equal(
+    (await (await request("/chats?page=1&q=history%2034")).json()).items[0].id,
+    "h34",
+  );
+  let chat = await (await request("/chats/h0")).json();
+  chat.messages[0].content = "edited";
+  assert.equal((await request("/chats/h0", "PUT", chat)).status, 200);
+  await restart();
+  chat = await (await request("/chats/h0")).json();
+  assert.equal(chat.messages[0].content, "edited");
+  chat.messages = [];
+  assert.equal((await request("/chats/h0", "PUT", chat)).status, 200);
+  assert.equal((await (await request("/chats/h0")).json()).messages.length, 0);
+});
+
+test("retry policy validates counts and retries transient upstream errors only", async (t) => {
+  let attempts = 0;
+  const { request } = await fixture(t, async () => {
+    attempts++;
+    return attempts === 1
+      ? new Response("", { status: 503 })
+      : new Response(
+          "data: " +
+            JSON.stringify({ choices: [{ delta: { content: "ok" } }] }) +
+            "\n\n",
+        );
+  });
+  const config = {
+    id: "retry",
+    baseUrl: "https://model.invalid/v1",
+    model: "test",
+    apiKey: "secret",
+    maxRetries: 1,
+  };
+  assert.equal(
+    (await request("/settings", "PUT", { ...config, maxRetries: 11 })).status,
+    400,
+  );
+  await request("/settings", "PUT", config);
+  assert.equal((await (await request("/settings")).json()).maxRetries, 1);
+  const text = await (
+    await request("/chat", "POST", {
+      messages: [{ role: "user", content: "test" }],
+    })
+  ).text();
+  assert.equal(attempts, 2);
+  assert.match(text, /ok/);
+});
+
+test("tool reads and lists are bounded and offer continuation offsets", async (t) => {
+  const { root } = await fixture(t);
+  await executeTool(root, "write_file", {
+    path: "large.md",
+    content: "a".repeat(25000),
+  });
+  const first = JSON.parse(
+    await executeTool(root, "read_file", { path: "large.md" }),
+  );
+  assert.equal(first.content.length, 12000);
+  const next = JSON.parse(
+    await executeTool(root, "read_file", {
+      path: "large.md",
+      offset: first.nextOffset,
+    }),
+  );
+  assert.equal(next.offset, 12000);
+  const files = JSON.parse(await executeTool(root, "list_files", { limit: 1 }));
+  assert.equal(files.files.length, 1);
+  assert.deepEqual(Object.keys(files.files[0]).sort(), ["path", "title"]);
+});
+
+test("cloud Agent completes file tools after acknowledgment and compacts write bodies", async (t) => {
+  let round = 0;
+  const { request, root, restart } = await fixture(t, async (_url, init) => {
+    round++;
+    const payload = JSON.parse(init.body);
+    if (round === 2) {
+      const call = payload.messages.find((m) => m.tool_calls).tool_calls[0];
+      assert.ok(call.function.arguments.length < 300);
+      assert.equal(payload.messages.at(-1).role, "tool");
+    }
+    const delta =
+      round === 1
+        ? {
+            tool_calls: [
+              {
+                index: 0,
+                id: "write",
+                type: "function",
+                function: {
+                  name: "write_file",
+                  arguments: JSON.stringify({
+                    path: "cloud-created.md",
+                    content: "x".repeat(15000),
+                  }),
+                },
+              },
+            ],
+          }
+        : { content: "finished" };
+    return new Response(
+      "data: " + JSON.stringify({ choices: [{ delta }] }) + "\n\n",
+    );
+  });
+  await request("/settings", "PUT", {
+    id: "c",
+    baseUrl: "https://model.invalid/v1",
+    model: "test",
+    apiKey: "secret",
+  });
+  const chat = {
+    id: "agent-cloud",
+    title: "Agent",
+    mode: "agent",
+    updatedAt: new Date().toISOString(),
+    messages: [{ id: "u", role: "user", content: "write" }],
+  };
+  await request("/chats/" + chat.id, "PUT", chat);
+  assert.equal(
+    (
+      await request("/chat", "POST", {
+        chatId: chat.id,
+        assistantId: "a",
+        mode: "agent",
+        cloud: true,
+        messages: chat.messages,
+      })
+    ).status,
+    202,
+  );
+  let saved;
+  for (let i = 0; i < 100; i++) {
+    saved = await (await request("/chats/" + chat.id)).json();
+    if (saved.generation.status !== "running") break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(saved.generation.status, "completed");
+  assert.equal(round, 2);
+  assert.equal(
+    (await fs.readFile(path.join(root, "cloud-created.md"), "utf8")).length,
+    15000,
+  );
+  assert.match(saved.messages[1].content, /finished/);
+  await restart();
+  assert.equal(
+    (await (await request("/chats/" + chat.id)).json()).generation.status,
+    "completed",
+  );
+});
+
+test("retry helper never retries authorization errors, exhausted counts or aborts", async () => {
+  const { fetchRetry } = await import("../server/retry.mjs");
+  for (const [status, retries, expected] of [
+    [401, 3, 1],
+    [503, 0, 1],
+    [503, 1, 2],
+  ]) {
+    let attempts = 0;
+    await fetchRetry(
+      async () => {
+        attempts++;
+        return new Response("", { status });
+      },
+      "https://invalid",
+      {},
+      retries,
+    );
+    assert.equal(attempts, expected);
+  }
+  let attempts = 0;
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(
+    fetchRetry(
+      async () => {
+        attempts++;
+        throw new Error("network");
+      },
+      "https://invalid",
+      { signal: controller.signal },
+      3,
+    ),
+  );
+  assert.equal(attempts, 1);
+});
